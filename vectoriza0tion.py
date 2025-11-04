@@ -436,33 +436,43 @@ def get_cluster_topic(cluster_members: List[Dict], cluster_embeds: np.ndarray, c
     sample = "\n---\n".join(reps)
 
     prompt = f"""أنت محلل خبير للمحتوى العربي على وسائل التواصل الاجتماعي.
-مهمتك: أعطني عنواناً قصيراً يصف الموضوع الأساسي المشترك بين هذه المنشورات. ركّز على الحدث/القضية/الشخص/المكان، بدون شرح إضافي.
+مهمتك: أعطني عنواناً قصيراً وواضحاً يصف الموضوع الأساسي المشترك بين هذه المنشورات. 
+العنوان يجب أن يكون جملة كاملة ومفهومة تلخص الموضوع بشكل دقيق.
+
 المنشورات:
 {sample}
 
-العنوان فقط بدون أي شرح:"""
+اكتب العنوان فقط كجملة كاملة ومفيدة:"""
 
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "max_tokens": 50
+        "temperature": 0.2,
+        "max_tokens": 100  # Increased to allow complete sentences
     }
     try:
         r = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
         r.raise_for_status()
         topic = r.json()["choices"][0]["message"]["content"].strip()
-        topic = re.sub(r'^[\d\.\-\s:"«»]+', '', topic)
-        topic = re.sub(r'[\d\.\-\s:"«»]+$', '', topic)
-        topic = topic.split("\n")[0].strip().strip('"').strip("'").strip("«").strip("»")
-        if not topic:
+        
+        # Only remove leading numbers/bullets, but keep the complete sentence
+        topic = re.sub(r'^[\d\.\-\s:]+', '', topic)
+        
+        # Remove surrounding quotes if present
+        topic = topic.strip('"').strip("'").strip("«").strip("»")
+        
+        # Take only the first line if multiple lines returned
+        topic = topic.split("\n")[0].strip()
+        
+        if not topic or len(topic) < 5:
             return "موضوع غير محدد"
+        
         return topic
-    except Exception:
+        
+    except Exception as e:
+        print(f"⚠️ Error getting topic from API: {e}")
         return "موضوع غير محدد"
-
-
 def extract_keywords(texts: List[str], top_n: int = 5) -> List[str]:
     words = []
     for text in texts:
