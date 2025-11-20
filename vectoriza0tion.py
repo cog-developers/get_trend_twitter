@@ -77,7 +77,7 @@ class Config:
             opensearch_password=os.getenv("OPENSEARCH_PASSWORD"),
             source_index=os.getenv("OPENSEARCH_INDEX", "searched-tweets-index"),
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
-            deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+            deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-reasoner"),
             min_cluster_size=int(os.getenv("MIN_CLUSTER_SIZE", "10")),
             hdbscan_min_cluster_size=int(os.getenv("HDBSCAN_MIN_CLUSTER_SIZE", "8")),
             hdbscan_min_samples=int(os.getenv("HDBSCAN_MIN_SAMPLES", "5")),
@@ -701,6 +701,210 @@ class TopicGenerator:
         top_idx = np.argsort(-sims)[:top_k]
         return [members[i]["text"] for i in top_idx]
     
+    def call_api_with_validation(self, prompt: str, max_retries: int = 3) -> str:
+        """Call API with validation and retry for bad responses"""
+        for attempt in range(max_retries):
+            try:
+                response = self.call_api(prompt)
+                
+                # Comprehensive validation checks
+                is_valid = (
+                    response and 
+                    len(response) > 15 and 
+                    not response.endswith('...') and
+                    not response.endswith('..') and
+                    not response.endswith('،') and
+                    not response.endswith('و') and
+                    not response.endswith('من') and
+                    not response.endswith('على') and
+                    not response.endswith('في') and
+                    len(response.split()) >= 4  # At least 4 words
+                )
+                
+                if is_valid:
+                    return response
+                
+                logger.warning(f"⚠️ Invalid response on attempt {attempt + 1}: '{response[:60]}'")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ API call failed on attempt {attempt + 1}: {e}")
+                
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+        
+        return ""  # Return empty string if all retries fail
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def call_api(self, posts_text: str) -> str:
+            """Call DeepSeek API to generate a clean, complete Arabic topic sentence"""
+            headers = {
+                "Authorization": f"Bearer {self.config.deepseek_api_key}",
+                "Content-Type": "application/json",
+            }
+
+            # Final optimized prompt
+            user_prompt = f"""
+        لدي مجموعة من المنشورات التالية:
+
+        {posts_text}
+
+        أريد منك إنتاج "عنوان موضوع" واحد فقط:
+        - جملة عربية كاملة.
+        - قصيرة وواضحة (10–18 كلمة).
+        - بدون نقاط حذف (...).
+        - بدون قوائم أو شرح إضافي.
+        - تجاهل المنشورات القصيرة عديمة المعنى.
+        - إذا كانت المنشورات غير متعلقة ببعض → أعطني أقرب فكرة مشتركة.
+
+        أعد فقط الجملة النهائية بدون أي شيء آخر.
+            """
+
+            payload = {
+                "model": "deepseek-reasoner",
+                "messages": [
+                    {"role": "user", "content": user_prompt}
+                ],
+                "temperature": 0.05,
+                "top_p": 0.92,
+                "max_tokens": 8192,       # يكفي جدًا لجملة واحدة كاملة بدون قطع
+                "response_mode": "final",
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+            }
+
+            response = requests.post(
+                self.config.deepseek_api_url,
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+
+            response.raise_for_status()
+
+            result = response.json()["choices"][0]["message"]["content"].strip()
+
+            # Clean final output just in case
+            result = result.replace("...", "").replace("..", "").strip()
+
+            return result
+
+    def get_cluster_topic(
+        self,
+        cluster_members: List[Dict],
+        cluster_embeds: np.ndarray,
+        centroid: np.ndarray
+    ) -> str:
+        """Generate topic label for cluster"""
+        if not cluster_members:
+            return "موضوع غير محدد"
+
+        try:
+            reps = self.select_representative_texts(
+                cluster_members,
+                cluster_embeds,
+                centroid,
+                top_k=self.config.representative_texts
+            )
+            
+            sample = "\n---\n".join(reps)
+
+            prompt = f"""
+أنت محلل محتوى اجتماعي محترف ومتخصص في فهم منشورات المستخدمين باللغة العربية.
+مهمتك: استخرج موضوعاً واحداً واضحاً يصف بدقة محتوى المنشورات التالية.
+
+⚠️ القواعد الصارمة:
+- اكتب الموضوع مباشرة دون مقدمات
+- جملة واحدة كاملة فقط (10-15 كلمة)
+- لا تبدأ بـ: "الموضوع"، "المنشورات"، "يتناول"، "الموضوعات المستخرجة"
+- لا تستخدم نقاط التعليق (...) أبداً
+- اكتب جملة تامة المعنى ذات نهاية واضحة
+- إذا كان المحتوى غير مفيد، أجب بـ: "غير قابل للتحديد"
+
+المنشورات:
+{sample}
+
+أكتب موضوع واحد فقط بجملة كاملة:"""
+
+            topic = self.call_api_with_validation(prompt)
+            
+            if not topic:
+                logger.warning("⚠️ Failed to get valid topic after retries")
+                return "موضوع غير محدد"
+            
+            # Enhanced cleaning logic
+            # 1. Remove common meta-phrases in Arabic
+            meta_phrases = [
+                r'^الموضوعات?\s*(المستخرجة|هو|هي)?\s*:?\s*',
+                r'^المنشورات?\s*(تتناول|تتحدث عن)\s*:?\s*',
+                r'^العنوان\s*:?\s*',
+                r'^الموضوع\s*(الرئيسي)?\s*:?\s*',
+                r'^يتحدث\s*المنشور\s*عن\s*:?\s*',
+                r'^يتناول\s*المنشور\s*',
+                r'^هذه?\s*المنشورات?\s*',
+            ]
+            for pattern in meta_phrases:
+                topic = re.sub(pattern, '', topic, flags=re.IGNORECASE)
+            
+            # 2. Remove leading numbers, bullets, dashes, colons
+            topic = re.sub(r'^[\d\.\-\s:•]+', '', topic)
+            
+            # 3. Remove quotes and brackets
+            topic = topic.strip('"').strip("'").strip("«").strip("»")
+            topic = topic.strip('[]').strip('()').strip('{}')
+            
+            # 4. Take only first line (in case of multi-line response)
+            topic = topic.split("\n")[0].strip()
+            
+            # 5. Remove ALL forms of ellipsis and incomplete markers
+            topic = re.sub(r'\.{2,}$', '', topic)  # Remove trailing ...
+            topic = re.sub(r'…+$', '', topic)  # Arabic ellipsis
+            topic = topic.rstrip('.:،؛')  # Remove trailing punctuation
+            
+            # 6. Check if sentence was cut off mid-word or incomplete
+            # Arabic prefixes that indicate incomplete text
+            incomplete_letter_endings = ['ال', 'و', 'ف', 'ب', 'ك', 'ل', 'لل']
+            if any(topic.endswith(' ' + ending) for ending in incomplete_letter_endings):
+                logger.warning(f"⚠️ Topic appears cut off: '{topic}'")
+                return "موضوع غير محدد"
+            
+            # 7. Validate minimum length
+            if not topic or len(topic) < 10:
+                logger.warning(f"⚠️ Topic too short after cleaning: '{topic}'")
+                return "موضوع غير محدد"
+            
+            # 8. Check word count and incomplete sentences
+            words = topic.split()
+            if len(words) < 3:
+                logger.warning(f"⚠️ Topic too short (less than 3 words): '{topic}'")
+                return "موضوع غير محدد"
+            
+            # 9. Check for incomplete sentences (ending with connectors or prepositions)
+            incomplete_word_endings = ['و', 'أو', 'ثم', 'لكن', 'بل', 'من', 'في', 'على', 'إلى', 'عن', 'مع']
+            last_word = words[-1]
+            if last_word in incomplete_word_endings:
+                logger.warning(f"⚠️ Topic ends with connector '{last_word}': '{topic}'")
+                return "موضوع غير محدد"
+            
+            # 10. Enforce max length (prevent overly long topics)
+            if len(words) > 20:
+                logger.warning(f"⚠️ Topic too long ({len(words)} words), truncating")
+                topic = ' '.join(words[:18]) + '...'
+            
+            # 11. Final validation - ensure it looks like a complete sentence
+            # Check if it has at least one verb-like word or meaningful content
+            if len(topic.split()) < 5:
+                logger.warning(f"⚠️ Topic might be incomplete: '{topic}'")
+                # Don't reject, but log for awareness
+            
+            return topic
+            
+        except Exception as e:
+            logger.error(f"⚠️ Error generating topic: {e}")
+            return "موضوع غير محدد"
+    
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10)
@@ -716,7 +920,7 @@ class TopicGenerator:
             "model": self.config.deepseek_model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.15,
-            "max_tokens": 150
+            "max_tokens": 8192
         }
         
         response = requests.post(
@@ -752,24 +956,148 @@ class TopicGenerator:
             prompt = f"""
 أنت محلل محتوى اجتماعي محترف ومتخصص في فهم منشورات المستخدمين باللغة العربية.
 مهمتك: استخرج **موضوعاً واحداً واضحاً وموجزاً** يصف بدقة محتوى المنشور التالي.
-- الموضوع يجب أن يكون **جملة كاملة، مفهومة، دقيقة، وغير عامة**.
-- لا تستخدم رموزاً أو اختصارات.
-- إذا كان المنشور **غير ذي معنى، فارغ، أو يحتوي على سب أو إهانات أو رموز فقط**، أجب: "غير قابل للتحديد".
-- اجعل الموضوع قابل الفهم لأي شخص يقرأه لأول مرة.
+
+⚠️ القواعد المهمة:
+- اكتب الموضوع مباشرة دون أي مقدمات أو عناوين أو شروحات
+- الموضوع يجب أن يكون جملة كاملة ومفهومة ودقيقة
+- لا تبدأ بعبارات مثل: "الموضوع هو" أو "المنشورات تتناول" أو "الموضوعات المستخرجة"
+- لا تستخدم نقاط أو أرقام أو رموز
+- إذا كان المنشور غير ذي معنى أو فارغ أو يحتوي على إساءات فقط، أجب بـ: "غير قابل للتحديد"
 
 المنشورات:
 {sample}
 
-اكتب العنوان فقط كجملة كاملة ومفيدة:"""
+الموضوع:"""
 
-            topic = self.call_api(prompt)
+            topic = self.call_api_with_validation(prompt)
             
-            # Clean topic
-            topic = re.sub(r'^[\d\.\-\s:]+', '', topic)
+            # Enhanced cleaning logic
+            # 1. Remove common meta-phrases in Arabic
+            meta_phrases = [
+                r'^الموضوعات?\s*(المستخرجة|هو|هي)?\s*:?\s*',
+                r'^المنشورات?\s*تتناول\s*:?\s*',
+                r'^العنوان\s*:?\s*',
+                r'^الموضوع\s*(الرئيسي)?\s*:?\s*',
+                r'^يتحدث\s*المنشور\s*عن\s*:?\s*',
+            ]
+            for pattern in meta_phrases:
+                topic = re.sub(pattern, '', topic, flags=re.IGNORECASE)
+            
+            # 2. Remove leading numbers, bullets, dashes, colons
+            topic = re.sub(r'^[\d\.\-\s:•]+', '', topic)
+            
+            # 3. Remove quotes and brackets
             topic = topic.strip('"').strip("'").strip("«").strip("»")
+            topic = topic.strip('[]').strip('()').strip('{}')
+            
+            # 4. Take only first line (in case of multi-line response)
             topic = topic.split("\n")[0].strip()
             
+            # 5. Remove trailing ellipsis or incomplete markers
+            topic = re.sub(r'\.{2,}$', '', topic)  # Remove trailing ...
+            topic = topic.rstrip('.:،')
+            
+            # 6. Validate length and completeness
             if not topic or len(topic) < 5:
+                logger.warning(f"⚠️ Topic too short after cleaning: '{topic}'")
+                return "موضوع غير محدد"
+            
+            # 7. Check for incomplete sentences (ending with connectors)
+            incomplete_endings = ['و', 'أو', 'ثم', 'لكن', 'بل']
+            last_word = topic.split()[-1] if topic.split() else ''
+            if last_word in incomplete_endings:
+                logger.warning(f"⚠️ Topic appears incomplete: '{topic}'")
+                return "موضوع غير محدد"
+            
+            # 8. Final validation - ensure it's not just the meta-phrase
+            if len(topic.split()) < 3:
+                logger.warning(f"⚠️ Topic too short (less than 3 words): '{topic}'")
+                return "موضوع غير محدد"
+            
+            return topic
+            
+        except Exception as e:
+            logger.error(f"⚠️ Error generating topic: {e}")
+            return "موضوع غير محدد" 
+def get_cluster_topic(
+        self,
+        cluster_members: List[Dict],
+        cluster_embeds: np.ndarray,
+        centroid: np.ndarray
+    ) -> str:
+        """Generate topic label for cluster"""
+        if not cluster_members:
+            return "موضوع غير محدد"
+
+        try:
+            reps = self.select_representative_texts(
+                cluster_members,
+                cluster_embeds,
+                centroid,
+                top_k=self.config.representative_texts
+            )
+            
+            sample = "\n---\n".join(reps)
+
+            prompt = f"""
+أنت محلل محتوى اجتماعي محترف ومتخصص في فهم منشورات المستخدمين باللغة العربية.
+مهمتك: استخرج **موضوعاً واحداً واضحاً وموجزاً** يصف بدقة محتوى المنشور التالي.
+
+⚠️ القواعد المهمة:
+- اكتب الموضوع مباشرة دون أي مقدمات أو عناوين أو شروحات
+- الموضوع يجب أن يكون جملة كاملة ومفهومة ودقيقة
+- لا تبدأ بعبارات مثل: "الموضوع هو" أو "المنشورات تتناول" أو "الموضوعات المستخرجة"
+- لا تستخدم نقاط أو أرقام أو رموز
+- إذا كان المنشور غير ذي معنى أو فارغ أو يحتوي على إساءات فقط، أجب بـ: "غير قابل للتحديد"
+
+المنشورات:
+{sample}
+
+الموضوع:"""
+
+            topic = self.call_api_with_validation(prompt)
+            
+            # Enhanced cleaning logic
+            # 1. Remove common meta-phrases in Arabic
+            meta_phrases = [
+                r'^الموضوعات?\s*(المستخرجة|هو|هي)?\s*:?\s*',
+                r'^المنشورات?\s*تتناول\s*:?\s*',
+                r'^العنوان\s*:?\s*',
+                r'^الموضوع\s*(الرئيسي)?\s*:?\s*',
+                r'^يتحدث\s*المنشور\s*عن\s*:?\s*',
+            ]
+            for pattern in meta_phrases:
+                topic = re.sub(pattern, '', topic, flags=re.IGNORECASE)
+            
+            # 2. Remove leading numbers, bullets, dashes, colons
+            topic = re.sub(r'^[\d\.\-\s:•]+', '', topic)
+            
+            # 3. Remove quotes and brackets
+            topic = topic.strip('"').strip("'").strip("«").strip("»")
+            topic = topic.strip('[]').strip('()').strip('{}')
+            
+            # 4. Take only first line (in case of multi-line response)
+            topic = topic.split("\n")[0].strip()
+            
+            # 5. Remove trailing ellipsis or incomplete markers
+            topic = re.sub(r'\.{2,}$', '', topic)  # Remove trailing ...
+            topic = topic.rstrip('.:،')
+            
+            # 6. Validate length and completeness
+            if not topic or len(topic) < 5:
+                logger.warning(f"⚠️ Topic too short after cleaning: '{topic}'")
+                return "موضوع غير محدد"
+            
+            # 7. Check for incomplete sentences (ending with connectors)
+            incomplete_endings = ['و', 'أو', 'ثم', 'لكن', 'بل']
+            last_word = topic.split()[-1] if topic.split() else ''
+            if last_word in incomplete_endings:
+                logger.warning(f"⚠️ Topic appears incomplete: '{topic}'")
+                return "موضوع غير محدد"
+            
+            # 8. Final validation - ensure it's not just the meta-phrase
+            if len(topic.split()) < 3:
+                logger.warning(f"⚠️ Topic too short (less than 3 words): '{topic}'")
                 return "موضوع غير محدد"
             
             return topic
@@ -777,8 +1105,7 @@ class TopicGenerator:
         except Exception as e:
             logger.error(f"⚠️ Error generating topic: {e}")
             return "موضوع غير محدد"
-
-
+        
 # ====== INDEXING MANAGER ======
 class IndexingManager:
     """Manage OpenSearch indexing operations"""
