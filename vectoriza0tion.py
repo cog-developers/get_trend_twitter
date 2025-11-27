@@ -1114,20 +1114,55 @@ class IndexingManager:
         self.os_client = os_client
         self.config = config
         self.topic_gen = TopicGenerator(config)
-    
+        self.target_index = os.getenv("TARGET_INDEX", "clustered-tweets-index")  # New index for clustered data
+
+    def create_target_index(self):
+        """Create the target index with the required mappings."""
+        mapping = {
+            "settings": {
+                "number_of_shards": 2,
+                "number_of_replicas": 1,
+                "index": {"refresh_interval": "5s"},
+            },
+            "mappings": {
+                "properties": {
+                    "group_topic": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+                    "cluster_id": {"type": "keyword"},
+                    "cluster_size": {"type": "integer"},
+                    "cluster_keywords": {"type": "keyword"},
+                    "fetched_at": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
+                    "updated_at": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
+                    "timestamp": {"type": "date", "format": "strict_date_optional_time||epoch_millis"}  # Added timestamp field
+                }
+            },
+        }
+
+        try:
+            if self.os_client.client.indices.exists(index=self.target_index):
+                logger.info(f"ℹ️ Target index '{self.target_index}' already exists.")
+            else:
+                self.os_client.client.indices.create(index=self.target_index, body=mapping)
+                logger.info(f"✅ Created target index '{self.target_index}'")
+        except Exception as e:
+            logger.error(f"❌ Failed to create target index '{self.target_index}': {e}")
+            raise
+
     def update_clusters_in_opensearch(
         self,
         merged_struct: Dict[int, Dict],
         docs: List[Dict]
     ):
-        """Update all documents with cluster information"""
+        """Update all documents with cluster information in the target index."""
         logger.info("\n" + "="*70)
         logger.info("📊 CLUSTER SUMMARY & INDEXING")
         logger.info("="*70)
-        
+
         actions = []
         clustered_ids = set()
         total_updated = 0
+
+        # Ensure the target index exists
+        self.create_target_index()
 
         # Sort by size descending
         cluster_items_sorted = sorted(
@@ -1150,14 +1185,16 @@ class IndexingManager:
 
             for m in members:
                 actions.append({
-                    "_op_type": "update",
-                    "_index": self.config.source_index,
+                    "_op_type": "index",  # Use "index" to insert into the new index
+                    "_index": self.target_index,
                     "_id": m["id"],
-                    "doc": {
+                    "_source": {
                         "group_topic": topic,
                         "cluster_id": f"group_{i}",
                         "cluster_size": size,
-                        "cluster_keywords": keywords
+                        "cluster_keywords": keywords,
+                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # Added timestamp field
                     }
                 })
                 clustered_ids.add(m["id"])
@@ -1167,38 +1204,12 @@ class IndexingManager:
                     success, _ = self.os_client.bulk_update(actions)
                     actions = []
 
-        # Handle unclustered documents (singletons)
-        logger.info("📝 Processing unclustered documents...")
-        singleton_count = 0
-        
-        for doc in docs:
-            if doc["id"] not in clustered_ids:
-                solo_keywords = TextProcessor.extract_keywords([doc["text"]], top_n=3)
-                actions.append({
-                    "_op_type": "update",
-                    "_index": self.config.source_index,
-                    "_id": doc["id"],
-                    "doc": {
-                        "group_topic": doc["text"][:80],
-                        "cluster_id": None,
-                        "cluster_size": 1,
-                        "cluster_keywords": solo_keywords
-                    }
-                })
-                total_updated += 1
-                singleton_count += 1
-
-                if len(actions) >= self.config.batch_size:
-                    success, _ = self.os_client.bulk_update(actions)
-                    actions = []
-
         # Final batch
         if actions:
             success, _ = self.os_client.bulk_update(actions)
 
-        logger.info(f"\n✅ Total updated: {total_updated} documents")
+        logger.info(f"\n✅ Total updated: {total_updated} documents in target index '{self.target_index}'")
         logger.info(f"   • Clustered: {len(clustered_ids)}")
-        logger.info(f"   • Singletons: {singleton_count}")
         logger.info("="*70)
 
 
