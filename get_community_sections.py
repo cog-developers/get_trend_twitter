@@ -1,593 +1,804 @@
 import os
 import re
-import requests
-import numpy as np
-from dotenv import load_dotenv
-from collections import defaultdict, Counter
-from opensearchpy import OpenSearch, helpers
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-from typing import List, Dict, Tuple, Optional
-import urllib3
-from datetime import datetime
-from functools import lru_cache
+import json
+import time
 import logging
+import random
+from datetime import datetime
+from collections import defaultdict, Counter
+from typing import List, Dict, Tuple, Optional
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+from dotenv import load_dotenv
+from opensearchpy import OpenSearch, helpers, exceptions
+from opensearchpy.connection import Urllib3HttpConnection
 from tqdm import tqdm
-import torch
+from urllib3.exceptions import NewConnectionError
 
 # ====== SETUP LOGGING ======
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 # ====== LOAD ENVIRONMENT VARIABLES ======
 load_dotenv()
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ====== CONFIG ======
-OPENSEARCH_NODE = os.getenv("OPENSEARCH_NODE")
-OPENSEARCH_USERNAME = os.getenv("OPENSEARCH_USERNAME")
-OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD")
-SOURCE_INDEX = os.getenv("OPENSEARCH_INDEX", "searched-tweets-index")
-STANCE_INDEX = os.getenv("STANCE_INDEX", "stance-analysis-index")
+OPENSEARCH_NODE = os.getenv("OPENSEARCH_NODE", "http://localhost:9200")
+OPENSEARCH_USERNAME = os.getenv("OPENSEARCH_USERNAME", "admin")
+OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD", "admin")
+SOURCE_INDEX = os.getenv("SOURCE_INDEX", "past-month-tweets-index")
+TARGET_INDEX = os.getenv("TARGET_INDEX", "classified-users-index")
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
-SEMANTIC_SIMILARITY_THRESHOLD = float(os.getenv("SEMANTIC_SIMILARITY_THRESHOLD", 0.85))
-KEYWORD_MATCH_MIN = int(os.getenv("KEYWORD_MATCH_MIN", 2))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 32))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 4))
+# Switched to the faster, more stable 'deepseek-chat' model.
+DEEPSEEK_MODEL = "deepseek-chat"
+
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 10))
+
+# Increased workers to leverage the faster model and improve throughput.
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))
+MAX_USERS = int(os.getenv("MAX_USERS", 0))      # 0 = all users
+
+RETRY_ATTEMPTS = 4
+RATE_LIMIT_DELAY = 1.5   # seconds between API calls
+ES_RETRY_DELAY = 1.0
 
 # ====== VALIDATE ENVIRONMENT ======
-if not all([OPENSEARCH_NODE, OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD]):
-    raise ValueError("❌ Missing OpenSearch credentials in .env file.")
+if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "your-api-key-here":
+    logger.error("❌ DEEPSEEK_API_KEY not set in environment!")
+    raise ValueError("Missing DEEPSEEK_API_KEY")
+
+logger.info(f"🔑 Using DeepSeek API Key: {DEEPSEEK_API_KEY[:8]}...{DEEPSEEK_API_KEY[-4:]}")
+logger.info(f"🌐 API Endpoint: {DEEPSEEK_API_URL}")
+logger.info(f"🤖 Model: {DEEPSEEK_MODEL}")
 
 # ====== INITIALIZE OPENSEARCH CLIENT ======
-es = OpenSearch(
-    [OPENSEARCH_NODE],
-    http_auth=(OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD),
-    verify_certs=False,
-    timeout=180,
-    max_retries=5,
-    retry_on_timeout=True
-)
+def init_opensearch():
+    try:
+        es = OpenSearch(
+            [OPENSEARCH_NODE],
+            http_auth=(OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD),
+            verify_certs=False,
+            timeout=60,
+            max_retries=3,
+            retry_on_timeout=True,
+            connection_class=Urllib3HttpConnection,
+            pool_maxsize=10,
+        )
+        if not es.ping():
+            raise ConnectionError("❌ Cannot connect to OpenSearch (ping failed)")
+        logger.info("✅ Connected to OpenSearch")
+        return es
+    except exceptions.AuthenticationException:
+        logger.error("❌ Authentication failed for OpenSearch. Check your username and password.")
+        raise
+    except exceptions.ConnectionError:
+        logger.error("❌ Failed to connect to OpenSearch. Check the OPENSEARCH_NODE URL.")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Unexpected error while initializing OpenSearch: {e}")
+        raise
 
-if not es.ping():
-    raise ConnectionError("❌ Cannot connect to OpenSearch.")
-logger.info("✅ Connected to OpenSearch.")
 
-# ====== CREATE STANCE ANALYSIS INDEX ======
-def create_stance_index():
-    """Create index for storing stance analysis results."""
-    index_body = {
+es = init_opensearch()
+
+# ====== LEBANESE POLITICAL PARTIES ======
+LEBANESE_PARTIES_PROMPT = """
+Major Lebanese Political Parties and Groups:
+**Christian Parties:**
+1. FPM (Free Patriotic Movement/التيار الوطني الحر) - Led by Gebran Bassil, founded by Michel Aoun
+2. Lebanese Forces (القوات اللبنانية/LF) - Led by Samir Geagea
+3. Kataeb (حزب الكتائب اللبنانية) - Led by Samy Gemayel
+4. Marada Movement (تيار المردة) - Led by Sleiman Frangieh
+**Shia Parties:**
+5. Hezbollah (حزب الله) - Led by Hassan Nasrallah/Naim Qassem
+6. Amal Movement (حركة أمل) - Led by Nabih Berri
+**Sunni Parties:**
+7. Future Movement (تيار المستقبل) - Led by Saad Hariri (currently suspended)
+**Druze Parties:**
+8. PSP (Progressive Socialist Party/الحزب التقدمي الاشتراكي) - Led by Walid Jumblatt/Taymour Jumblatt
+**Independent/Opposition:**
+9. MMFD (Citizens in a State/مواطنون ومواطنات في دولة) - Led by Charbel Nahas
+10. LCP (Lebanese Communist Party/الحزب الشيوعي اللبناني)
+11. October 17 Revolution Groups (مجموعات ثورة 17 تشرين) - Various independent activists
+12. Sabaa Party (حزب سبعة) - Political reform movement
+**Other Categories:**
+13. Media/Journalist (إعلامي) - Professional journalists and media figures
+14. Independent (مستقل/محايد) - No clear party affiliation
+15. Unknown (غير معروف) - Insufficient information
+"""
+
+# ====== CREATE TARGET INDEX ======
+def create_classified_index(force_recreate: bool = False):
+    """Create or recreate the classified users index"""
+    mapping = {
         "settings": {
             "number_of_shards": 2,
             "number_of_replicas": 1,
-            "index": {
-                "refresh_interval": "5s"
-            }
+            "index": {"refresh_interval": "5s"},
         },
         "mappings": {
             "properties": {
-                "original_post_id": {"type": "keyword"},
-                "post_text": {"type": "text", "analyzer": "standard"},
+                "user_id": {"type": "keyword"},
+                "username": {"type": "keyword"},
+                "name": {"type": "text"},
                 "party": {"type": "keyword"},
-                "stance_label": {"type": "keyword"},
                 "confidence": {"type": "keyword"},
-                "classification_method": {"type": "keyword"},
-                "similarity_score": {"type": "float"},
-                "matched_keywords": {"type": "keyword"},
+                "reasoning": {"type": "text"},
+                "tweet_count": {"type": "integer"},
+                "user_bio": {"type": "text"},
+                "sample_tweets": {"type": "text"},
+                "classified_at": {"type": "date"},
+                "classification_run_id": {"type": "keyword"},
+                "api_response_time_ms": {"type": "integer"},
+                "created_at": {"type": "date"},
+                "post_created_at": {"type": "date"},
                 "timestamp": {"type": "date"},
-                "analysis_run_id": {"type": "keyword"}
             }
-        }
-    }
-    
-    if es.indices.exists(index=STANCE_INDEX):
-        logger.info(f"ℹ️  Index '{STANCE_INDEX}' already exists.")
-    else:
-        es.indices.create(index=STANCE_INDEX, body=index_body)
-        logger.info(f"✅ Created index '{STANCE_INDEX}'")
-
-# ====== LOAD SENTENCE TRANSFORMER MODEL ======
-logger.info("⚙️ Loading sentence transformer model...")
-model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
-model.eval()
-if torch.cuda.is_available():
-    model = model.to('cuda')
-    logger.info("✅ Model moved to GPU")
-
-# ====== PARTY-SPECIFIC CONFIGURATION ======
-PARTY_CONFIG = {
-    "حزب الله": {
-        "aliases": ["حزب الله", "الحزب", "هزب الله", "حزبالله"],
-        "context_required": True,
-        "support_keywords": ["مقاومة", "صمود", "انتصار", "أبطال", "دعم المقاومة", "نصر"],
-        "oppose_keywords": ["ميليشيا", "سلاح غير شرعي", "إرهاب", "احتلال", "سيطرة", "حصر السلاح"]
-    },
-    "تيار المستقبل": {
-        "aliases": ["تيار المستقبل", "المستقبل السياسي"],
-        "context_required": True,
-        "support_keywords": ["سعد الحريري", "تيار", "ندعم المستقبل", "مع التيار"],
-        "oppose_keywords": ["ضد التيار", "فشل التيار"]
-    },
-    "القوات اللبنانية": {
-        "aliases": ["القوات اللبنانية", "قوات لبنانية", "سمير جعجع"],
-        "context_required": True,
-        "support_keywords": ["القوات اللبنانية", "دعم القوات", "مع القوات", "لائحة القوات"],
-        "oppose_keywords": ["ضد القوات اللبنانية", "ميليشيات القوات"]
-    },
-    "حركة حماس": {
-        "aliases": ["حركة حماس", "حماس"],
-        "context_required": False,
-        "support_keywords": ["مقاومة", "طوفان الأقصى", "دعم حماس", "أبطال حماس"],
-        "oppose_keywords": ["إرهاب حماس", "ضد حماس"]
-    }
-}
-
-# ====== KEYWORD DETECTION ======
-def build_keyword_patterns(party_config: Dict) -> Dict:
-    """Build optimized regex patterns for each party."""
-    patterns = {}
-    for party, config in party_config.items():
-        support_kw = config.get("support_keywords", [])
-        oppose_kw = config.get("oppose_keywords", [])
-        
-        if support_kw:
-            patterns[f"{party}_support"] = re.compile(
-                '|'.join(map(re.escape, support_kw)), 
-                re.IGNORECASE
-            )
-        if oppose_kw:
-            patterns[f"{party}_oppose"] = re.compile(
-                '|'.join(map(re.escape, oppose_kw)), 
-                re.IGNORECASE
-            )
-    return patterns
-
-KEYWORD_PATTERNS = build_keyword_patterns(PARTY_CONFIG)
-
-@lru_cache(maxsize=10000)
-def party_mentioned_in_context(text: str, party: str) -> bool:
-    """Check if party is actually mentioned in the text."""
-    config = PARTY_CONFIG.get(party, {})
-    aliases = config.get("aliases", [party])
-    for alias in aliases:
-        if alias in text:
-            return True
-    return False
-
-# ====== ENHANCED KEYWORD LABELING WITHOUT NEUTRAL ======
-@lru_cache(maxsize=10000)
-def keyword_label_cached(text: str, party: str) -> Tuple[str, int, List[str]]:
-    """Enhanced keyword matching to ensure classification as 'with' or 'against'."""
-    if not party_mentioned_in_context(text, party):
-        logger.debug(f"[Keyword Label] Party '{party}' not mentioned in text.")
-        return "against", 0, []  # Default to 'against' if party is not mentioned
-
-    support_pattern_key = f"{party}_support"
-    oppose_pattern_key = f"{party}_oppose"
-
-    matched_with = []
-    matched_against = []
-
-    if support_pattern_key in KEYWORD_PATTERNS:
-        support_matches = KEYWORD_PATTERNS[support_pattern_key].findall(text)
-        matched_with = list(set(support_matches))
-
-    if oppose_pattern_key in KEYWORD_PATTERNS:
-        oppose_matches = KEYWORD_PATTERNS[oppose_pattern_key].findall(text)
-        matched_against = list(set(oppose_matches))
-
-    with_score = sum(len(match) for match in matched_with)  # Weight by keyword length
-    against_score = sum(len(match) for match in matched_against)
-
-    logger.debug(f"[Keyword Label] Party: {party}, With Score: {with_score}, Against Score: {against_score}, Matched With: {matched_with}, Matched Against: {matched_against}")
-
-    # Always classify as 'with' or 'against'
-    if with_score >= against_score:
-        return "with", with_score, matched_with
-    else:
-        return "against", against_score, matched_against
-
-# ====== PROTOTYPES ======
-def build_prototypes_for_party(party_name: str) -> Dict[str, List[str]]:
-    """Build richer prototypes with more variety."""
-    config = PARTY_CONFIG.get(party_name, {})
-    
-    prototypes = {
-        "with": [
-            f"أنا مع {party_name} بقوة.",
-            f"أنا مع {party_name} بكل فخر.",
-            f"أدعم {party_name} وموقفهم.",
-            f"{party_name} يمثلنا بشكل جيد.",
-            f"نحن مع {party_name}.",
-            f"{party_name} على حق.",
-            f"أؤيّد {party_name}.",
-            f"مع {party_name} دائماً."
-        ],
-        "against": [
-            f"أنا ضد {party_name} تماماً.",
-            f"لست مع {party_name} أبداً.",
-            f"أرفض {party_name} وسياساتهم.",
-            f"{party_name} مرفوض عندي.",
-            f"ضد سياسات {party_name}.",
-            f"{party_name} يضر بالبلد.",
-            f"لا أؤيّد {party_name}.",
-            f"ضد {party_name} كلياً."
-        ],
-        "neutral": [
-            f"تقرير عن {party_name}.",
-            f"خبر يتعلق ب {party_name}.",
-            f"معلومات عن {party_name}.",
-            "هذا محتوى معلوماتي.",
-            "تحليل سياسي محايد.",
-            "تغطية إخبارية."
-        ]
-    }
-    
-    if party_name in config:
-        for kw in config.get("support_keywords", [])[:3]:
-            prototypes["with"].append(f"{party_name} و{kw}.")
-        for kw in config.get("oppose_keywords", [])[:3]:
-            prototypes["against"].append(f"{party_name} {kw}.")
-    
-    return prototypes
-
-def embed_prototypes(parties: List[str], batch_size: int = 16) -> Dict[str, Dict[str, np.ndarray]]:
-    """Precompute embeddings for all party prototypes."""
-    proto_emb = {}
-    model.eval()
-    
-    with torch.no_grad():
-        for p in parties:
-            prototypes = build_prototypes_for_party(p)
-            proto_emb[p] = {}
-            
-            for label, texts in prototypes.items():
-                if not texts:
-                    proto_emb[p][label] = np.empty((0, model.get_sentence_embedding_dimension()))
-                    continue
-                
-                embeddings = []
-                for i in range(0, len(texts), batch_size):
-                    batch_texts = texts[i:i+batch_size]
-                    batch_emb = model.encode(batch_texts, convert_to_numpy=True, show_progress_bar=False)
-                    embeddings.append(batch_emb)
-                
-                proto_emb[p][label] = np.vstack(embeddings)
-    
-    return proto_emb
-
-# ====== BATCH EMBEDDING ======
-def batch_encode_texts(texts: List[str], batch_size: int = BATCH_SIZE) -> np.ndarray:
-    """Encode texts in batches."""
-    if not texts:
-        return np.array([])
-    return model.encode(texts, convert_to_numpy=True, batch_size=batch_size, show_progress_bar=False)
-
-# ====== SEMANTIC DETECTION ======
-def semantic_label_batch(embeddings: np.ndarray, proto_emb: Dict[str, np.ndarray], 
-                         threshold: float = SEMANTIC_SIMILARITY_THRESHOLD) -> List[Tuple[str, float]]:
-    """Vectorized semantic labeling to ensure classification as 'with' or 'against'."""
-    results = []
-
-    for emb in embeddings:
-        emb = emb.reshape(1, -1)
-        scores = {}
-
-        for label in ["with", "against"]:  # Removed 'neutral'
-            sims = cosine_similarity(emb, proto_emb[label])
-            scores[label] = float(np.max(sims))
-
-        best_label = max(scores, key=scores.get)
-        best_score = scores[best_label]
-
-        logger.debug(f"[Semantic Label] Scores: {scores}, Best Label: {best_label}, Best Score: {best_score}")
-
-        # Always classify as 'with' or 'against'
-        results.append((best_label, best_score))
-
-    return results
-
-# ====== FETCH POSTS ======
-def fetch_posts_for_parties_texts(parties: List[str], max_per_party: int = 500) -> Dict[str, Dict]:
-    """Fetch posts with improved party-specific queries."""
-    from opensearchpy.helpers import scan
-    topics = defaultdict(lambda: {'doc_count': 0, 'posts': []})
-
-    logger.info("\n🎯 FETCHING POSTS FOR LEBANESE POLITICAL PARTIES")
-
-    for party in parties:
-        config = PARTY_CONFIG.get(party, {})
-        aliases = config.get("aliases", [party])
-        
-        should_clauses = [{"match_phrase": {"post_text": alias}} for alias in aliases]
-        
-        query = {
-            "query": {
-                "bool": {
-                    "should": should_clauses,
-                    "minimum_should_match": 1
-                }
-            },
-            "_source": ["post_text"]
-        }
-        
-        seen_texts = set()
-        count = 0
-        
-        for doc in scan(es, query=query, index=SOURCE_INDEX, size=500, scroll="5m"):
-            text = doc.get("_source", {}).get("post_text", "") or ""
-            
-            if not text or len(text) < 20 or text in seen_texts:
-                continue
-            
-            if not party_mentioned_in_context(text, party):
-                continue
-                
-            seen_texts.add(text)
-            topics[party]['doc_count'] += 1
-            
-            if len(topics[party]['posts']) < max_per_party:
-                topics[party]['posts'].append({'id': doc["_id"], 'text': text})
-            
-            count += 1
-        
-        logger.info(f"✅ Retrieved {count} relevant posts for party '{party}'")
-    
-    return dict(topics)
-
-# ====== DEEPSEEK INTEGRATION ======
-def deepseek_classify(text: str, api_key: str, model: str) -> Tuple[Optional[str], Optional[float]]:
-    """Classify text using DeepSeek API."""
-    url = "https://api.deepseek.ai/v1/classify"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": model,
-        "inputs": [text]
+        },
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        if es.indices.exists(index=TARGET_INDEX):
+            if force_recreate:
+                logger.info(f"🗑️  Deleting existing index '{TARGET_INDEX}'...")
+                es.indices.delete(index=TARGET_INDEX)
+            else:
+                logger.info(f"ℹ️  Index '{TARGET_INDEX}' already exists, will append results")
+                return
+        es.indices.create(index=TARGET_INDEX, body=mapping)
+        logger.info(f"✅ Created index '{TARGET_INDEX}'")
+    except Exception as e:
+        logger.error(f"❌ Error creating index: {e}")
+        raise
+
+
+# ====== HELPER: RETRY WRAPPER FOR ES CALLS ======
+def es_call_with_retries(fn, *args, **kwargs):
+    """Call an OpenSearch function with exponential backoff retries for network errors."""
+    attempt = 0
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            attempt += 1
+            err_str = str(e)
+            if attempt > RETRY_ATTEMPTS:
+                # IMPORTANT: If it's a 400 RequestError (like the mapping error), we re-raise immediately
+                # so the calling function (enrich_user_with_details) can handle the fallback.
+                if isinstance(e, exceptions.RequestError) and e.status_code == 400:
+                    raise # Re-raise for specific handling
+
+                logger.error(f"❌ OpenSearch operation failed after {attempt} attempts: {e}")
+                raise
+            # Retry on connection related errors or transient errors
+            if isinstance(e, exceptions.RequestError) and e.status_code == 400:
+                # If it's a 400, don't retry here, let the calling function handle it immediately (after one attempt)
+                raise
+
+            logger.warning(f"⏳ OpenSearch error (attempt {attempt}/{RETRY_ATTEMPTS}): {e}. Retrying...")
+            sleep_time = ES_RETRY_DELAY * (2 ** (attempt - 1)) + random.random() * 0.5
+            time.sleep(sleep_time)
+
+
+# ====== FETCH USERS - SCROLL (robust) ======
+def fetch_all_users_scroll(limit: int = 0) -> List[Dict]:
+    """Fetch users using scroll API (more robust, works with any mapping)"""
+    logger.info(f"📥 Fetching users from '{SOURCE_INDEX}' using scroll...")
+
+    query = {
+        "size": 100,
+        "_source": ["user_details", "user_name", "user_username"],
+        "query": {"match_all": {}},
+    }
+
+    users_map = {}
+
+    try:
+        response = es_call_with_retries(es.search, index=SOURCE_INDEX, body=query, scroll="2m")
+        scroll_id = response.get("_scroll_id")
+        hits = response.get("hits", {}).get("hits", [])
+        while hits:
+            for hit in hits:
+                source = hit.get("_source", {})
+                user_details = source.get("user_details", {})
+                user_id = user_details.get("user_id") or source.get("user_id")
+                username = user_details.get("username") or source.get("user_username")
+                name = user_details.get("name") or source.get("user_name")
+
+                if not user_id:
+                    continue
+
+                if user_id not in users_map:
+                    users_map[user_id] = {
+                        "user_id": user_id,
+                        "username": username or f"user_{user_id}",
+                        "name": name or username or f"User {user_id}",
+                        "doc_count": 1,
+                    }
+                else:
+                    users_map[user_id]["doc_count"] += 1
+
+                if limit > 0 and len(users_map) >= limit:
+                    break
+
+            if limit > 0 and len(users_map) >= limit:
+                break
+
+            if not scroll_id:
+                break
+
+            try:
+                response = es_call_with_retries(es.scroll, scroll_id=scroll_id, scroll="2m")
+                scroll_id = response.get("_scroll_id")
+                hits = response.get("hits", {}).get("hits", [])
+            except Exception as e:
+                logger.error(f"❌ Error during scroll fetch: {e}")
+                break
+
+        # Clear scroll if we have one
+        try:
+            if scroll_id:
+                es_call_with_retries(es.clear_scroll, scroll_id=scroll_id)
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"❌ Error in scroll fetch: {e}")
+        return []
+
+    users = list(users_map.values())
+    if limit > 0:
+        users = users[:limit]
+
+    logger.info(f"✅ Found {len(users)} unique users")
+    return users
+
+
+# ====== FETCH USERS (aggregation fallback) ======
+def fetch_all_users(limit: int = 0) -> List[Dict]:
+    """Fetch all unique users from the source index using aggregations, fallback to scroll."""
+    logger.info(f"📥 Fetching users from '{SOURCE_INDEX}'...")
+
+    try:
+        mapping = es_call_with_retries(es.indices.get_mapping, index=SOURCE_INDEX)
+        properties = mapping.get(SOURCE_INDEX, {}).get("mappings", {}).get("properties", {})
+        user_details = properties.get("user_details", {}).get("properties", {})
+
+        # Attempt to dynamically determine field names
+        name_field = "user_details.name.keyword" if "name" in user_details else "user_name.keyword"
+        username_field = "user_details.username.keyword" if "username" in user_details else "user_username.keyword"
+        # User ID is often nested, but ensure it's correct for aggregation
+        user_id_field = "user_details.user_id" if "user_id" in user_details else "user_id"
+
+        # Check if the fields are actually available as keyword fields for aggregation
+        if not properties.get(name_field.split('.')[0], {}).get('type') in ('keyword', 'text'):
+             name_field = "user_name" # Fallback to non-keyword for aggregation fields if needed
+
+        if not properties.get(username_field.split('.')[0], {}).get('type') in ('keyword', 'text'):
+             username_field = "user_username"
+
+        logger.info(f"📋 Using fields: user_id={user_id_field}, username={username_field}, name={name_field}")
+
+        count_response = es_call_with_retries(es.count, index=SOURCE_INDEX)
+        total_docs = count_response.get("count", 0)
+        logger.info(f"📊 Total documents in index: {total_docs}")
+
+        if total_docs == 0:
+            logger.warning(f"⚠️  No documents found in '{SOURCE_INDEX}'")
+            return []
+
+    except Exception as e:
+        logger.warning(f"⚠️  Could not detect field mappings: {e}, falling back to scroll method")
+        return fetch_all_users_scroll(limit)
+
+    agg_query = {
+        "size": 0,
+        "aggs": {
+            "unique_users": {
+                "composite": {
+                    "size": 100,
+                    "sources": [
+                        {"user_id": {"terms": {"field": user_id_field}}},
+                        {"username": {"terms": {"field": username_field}}},
+                        {"name": {"terms": {"field": name_field}}},
+                    ],
+                }
+            }
+        },
+    }
+
+    users = []
+    after_key = None
+    try:
+        iteration = 0
+        while True:
+            iteration += 1
+            if after_key:
+                agg_query["aggs"]["unique_users"]["composite"]["after"] = after_key
+            try:
+                response = es_call_with_retries(es.search, index=SOURCE_INDEX, body=agg_query)
+                buckets = response.get("aggregations", {}).get("unique_users", {}).get("buckets", [])
+                logger.debug(f"Iteration {iteration}: Got {len(buckets)} buckets")
+                if not buckets:
+                    if iteration == 1:
+                        logger.warning("⚠️  No buckets returned from aggregation, trying scroll method")
+                        return fetch_all_users_scroll(limit)
+                    break
+                for bucket in buckets:
+                    key = bucket.get("key", {})
+                    users.append({
+                        "user_id": key.get("user_id"),
+                        "username": key.get("username"),
+                        "name": key.get("name"),
+                        "doc_count": bucket.get("doc_count", 0),
+                    })
+                after_key = response.get("aggregations", {}).get("unique_users", {}).get("after_key")
+                if not after_key:
+                    break
+                if limit > 0 and len(users) >= limit:
+                    users = users[:limit]
+                    break
+            except Exception as e:
+                logger.error(f"❌ Error fetching users with aggregation: {e}")
+                if iteration == 1:
+                    logger.warning("⚠️  Aggregation failed, falling back to scroll method")
+                    return fetch_all_users_scroll(limit)
+                break
+
+        logger.info(f"✅ Found {len(users)} unique users via aggregation")
+        return users
+    except Exception as e:
+        logger.warning(f"⚠️  Aggregation failed: {e}, falling back to scroll method")
+        return fetch_all_users_scroll(limit)
+
+
+# ====== ENRICH USER WITH DETAILS (FIXED: Robust sort field checking) ======
+@lru_cache(maxsize=2000)
+def enrich_user_with_details(user_id: str) -> Tuple[str, str]:
+    date_sort_fields = []
+    mapping = es.indices.get_mapping(index=SOURCE_INDEX)
+    props = mapping[SOURCE_INDEX]['mappings']['properties']
+
+    for f in ["created_at", "post_created_at", "timestamp"]:
+        if f in props:
+            date_sort_fields.append(f)
+
+    if not date_sort_fields:
+        logger.warning(f"No sortable date fields found for user {user_id}")
+        date_sort_fields = []  # fallback to unsorted
+
+    query = {
+        "query": {"term": {"user_details.user_id": user_id}},
+        "size": 15,
+        "_source": ["user_details.user_bio", "post_text"],
+    }
+
+    if date_sort_fields:
+        query["sort"] = [{field: {"order": "desc"}} for field in date_sort_fields]
+
+    try:
+        response = es_call_with_retries(es.search, index=SOURCE_INDEX, body=query)
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch tweets for user {user_id}: {e}")
+        return "", ""
+
+    hits = response.get("hits", {}).get("hits", [])
+    if not hits:
+        return "", ""
+
+    bio = hits[0].get("_source", {}).get("user_details", {}).get("user_bio", "")
+    tweets = [
+        h.get("_source", {}).get("post_text", "")[:300]
+        for h in hits[:10]
+        if h.get("_source", {}).get("post_text")
+    ]
+    tweets_text = " | ".join(tweets)
+
+    return bio, tweets_text
+
+
+
+
+# ====== DEEPSEEK API CLASSIFICATION ======
+def extract_json_from_text(text: str) -> Optional[Dict]:
+    """
+    Attempt to find a JSON object inside text (handles code fences or plain JSON).
+    Returns dict or None.
+    """
+    if not text:
+        return None
+    # First try direct json load
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Finds the content between the first '{' and the last '}' in the string.
+    # Handles markdown code fences (```json{...}```) and plain text
+    m = re.search(r"(\{.*\})", text, flags=re.DOTALL)
+
+    if m:
+        candidate = m.group(1)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            # Try to fix common mistakes: trailing commas
+            candidate_fixed = re.sub(r",(\s*[}\]])", r"\1", candidate)
+            try:
+                return json.loads(candidate_fixed)
+            except Exception:
+                return None
+    return None
+
+
+def classify_with_deepseek(
+    name: str,
+    username: str,
+    bio: str,
+    recent_tweets: str,
+    retry_count: int = 0,
+) -> Tuple[str, str, str, int]:
+    """
+    Classify user with DeepSeek API
+    Returns: (party, confidence, reasoning, response_time_ms)
+    """
+    prompt = f"""You are an expert analyst of Lebanese politics. Analyze this Twitter user and classify their political affiliation.
+
+**User Profile:**
+- Name: {name}
+- Username: @{username}
+- Bio: {bio[:400] if bio else "N/A"}
+- Recent Tweets (sample): {recent_tweets[:1200] if recent_tweets else "N/A"}
+
+{LEBANESE_PARTIES_PROMPT}
+
+**Analysis Instructions:**
+1. Identify political leanings from name, bio, and tweet content
+2. Look for: party membership indicators, support/opposition rhetoric, shared ideologies, mentions of party leaders
+3. Consider Arabic and English content
+4. Classify into ONE category from the list above
+5. If truly ambiguous, use "Independent" or "Unknown"
+
+**Respond ONLY with valid JSON:**
+{{   "party": "Exact party name from list above",   "confidence": "high|medium|low",   "reasoning": "Brief 2-3 sentence explanation" }}"""
+
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an expert political analyst specializing in Lebanese politics. Respond ONLY with valid JSON.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 800,
+    }
+
+    start_time = time.time()
+
+    try:
+        # Increased timeout to 60s for safety, though the faster model should complete quickly.
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=60)
+        response_time = int((time.time() - start_time) * 1000)
+
+        # Rate limiting handling
+        if response.status_code == 429 and retry_count < RETRY_ATTEMPTS:
+            wait_time = (2 ** retry_count) * RATE_LIMIT_DELAY
+            logger.warning(f"⏳ Rate limited by DeepSeek, waiting {wait_time:.1f}s (retry {retry_count + 1})")
+            time.sleep(wait_time + random.random() * 0.5)
+            return classify_with_deepseek(name, username, bio, recent_tweets, retry_count + 1)
+
         response.raise_for_status()
         result = response.json()
 
-        if result and "outputs" in result and len(result["outputs"]) > 0:
-            label = result["outputs"][0].get("label")
-            confidence = result["outputs"][0].get("confidence")
-            return label, confidence
-    except requests.RequestException as e:
-        logger.error(f"❌ DeepSeek API error: {e}")
+        # Validate structure
+        choices = result.get("choices") or []
+        if not choices:
+            logger.error(f"❌ No choices returned from DeepSeek for @{username}: {result}")
+            return "Unknown", "low", "No API choices", response_time
 
-    return None, None
+        content = choices[0].get("message", {}).get("content", "")
+        if not content:
+            # Try alternatives
+            content = json.dumps(result)
 
-# ====== STANCE ANALYSIS ======
-def analyze_stance_for_party(posts: List[Dict], party: str, 
-                            proto_emb_party: Dict[str, np.ndarray], 
-                            use_deepseek_if_uncertain: bool = False) -> Dict:
-    """Multi-stage analysis with improved accuracy."""
-    results = []
-    counts = Counter()
-    
-    keyword_posts = []
-    semantic_posts = []
-    semantic_indices = []
-    
-    for idx, p in enumerate(posts):
-        text = p['text']
-        kw_label, kw_count, matched_kw = keyword_label_cached(text, party)
-        
-        if kw_label and kw_count >= KEYWORD_MATCH_MIN:
-            counts[kw_label] += 1
-            results.append({
-                'id': p['id'], 
-                'text': text, 
-                'label': kw_label, 
-                'reason': f"keyword({kw_count})",
-                'confidence': 'high',
-                'score': 1.0,
-                'matched_keywords': matched_kw
-            })
-        else:
-            semantic_posts.append(text)
-            semantic_indices.append(idx)
-    
-    if semantic_posts:
-        logger.info(f"  🧠 Running semantic analysis on {len(semantic_posts)} posts...")
-        embeddings = batch_encode_texts(semantic_posts, batch_size=BATCH_SIZE)
-        semantic_labels = semantic_label_batch(embeddings, proto_emb_party)
-        
-        for original_idx, (sem_label, sem_score) in zip(semantic_indices, semantic_labels):
-            p = posts[original_idx]
-            text = p['text']
-            
-            if sem_label in ("with", "against") and sem_score >= 0.75:
-                confidence = 'high'
-            elif sem_label in ("with", "against") and sem_score >= SEMANTIC_SIMILARITY_THRESHOLD:
-                confidence = 'medium'
-            else:
-                confidence = 'low'
-            
-            label = sem_label
-            reason = f"semantic({sem_score:.3f})"
-            
-            # Use DeepSeek if enabled and confidence is low
-            if use_deepseek_if_uncertain and confidence == 'low':
-                logger.info(f"🔍 Using DeepSeek for uncertain post: {text[:50]}...")
-                ds_label, ds_confidence = deepseek_classify(text, DEEPSEEK_API_KEY, DEEPSEEK_MODEL)
+        # Try to extract JSON from the content robustly
+        classification = extract_json_from_text(content)
+        if not classification:
+            logger.error(f"❌ JSON parse error for @{username}: {content[:400]}")
+            return "Unknown", "low", "Invalid API response format", response_time
 
-                if ds_label in ("with", "against") and ds_confidence:
-                    confidence = "high" if ds_confidence >= 0.85 else "medium"
-                    label = ds_label
-                    reason = f"deepseek({ds_confidence:.3f})"
+        return (
+            classification.get("party", "Unknown"),
+            classification.get("confidence", "low"),
+            classification.get("reasoning", "") or "",
+            response_time,
+        )
 
-            counts[label] += 1
-            results.append({
-                'id': p['id'], 
-                'text': text, 
-                'label': label, 
-                'reason': reason,
-                'confidence': confidence,
-                'score': sem_score,
-                'matched_keywords': []
-            })
-    
-    return {'counts': counts, 'results': results}
+    except requests.exceptions.Timeout:
+        response_time = int((time.time() - start_time) * 1000)
+        logger.error(f"⏱️  API timeout for @{username}")
+        if retry_count < RETRY_ATTEMPTS:
+            time.sleep((2 ** retry_count) * RATE_LIMIT_DELAY)
+            return classify_with_deepseek(name, username, bio, recent_tweets, retry_count + 1)
+        return "Unknown", "low", "API timeout", response_time
 
-# ====== PARALLEL PROCESSING ======
-def analyze_all_parties_parallel(topics: Dict[str, Dict], proto_emb_all: Dict, 
-                                use_deepseek: bool = False) -> Dict:
-    """Analyze multiple parties in parallel."""
-    all_analysis = {}
-    
+    except requests.exceptions.RequestException as e:
+        response_time = int((time.time() - start_time) * 1000)
+        err_str = str(e)
+        if "401" in err_str or "Unauthorized" in err_str:
+            logger.error(f"❌ Authentication failed for @{username} - check DEEPSEEK_API_KEY")
+            return "Unknown", "low", "API authentication failed", response_time
+
+        logger.error(f"❌ API error for @{username}: {e}")
+        if retry_count < RETRY_ATTEMPTS:
+            time.sleep((2 ** retry_count) * RATE_LIMIT_DELAY)
+            return classify_with_deepseek(name, username, bio, recent_tweets, retry_count + 1)
+        return "Unknown", "low", f"API error: {err_str}", response_time
+
+    except json.JSONDecodeError as e:
+        response_time = int((time.time() - start_time) * 1000)
+        logger.error(f"❌ JSON decode error for @{username}: {e}")
+        return "Unknown", "low", "Invalid API response format", response_time
+
+    except Exception as e:
+        response_time = int((time.time() - start_time) * 1000)
+        logger.error(f"❌ Unexpected error for @{username}: {e}")
+        return "Unknown", "low", str(e), response_time
+
+
+# ====== CLASSIFY SINGLE USER (WORKER) ======
+def classify_user(user: Dict, run_id: str) -> Dict:
+    """
+    Worker function to classify a single user.
+    Returns a Dictionary (document) ready for indexing.
+    """
+    # Defensive checks: ensure `user` is a dict and contains a user_id
+    if not user or not isinstance(user, dict):
+        raise ValueError("Invalid user object passed to classify_user")
+
+    user_id = user.get("user_id")
+    username = user.get("username", "unknown")
+    name = user.get("name", "unknown")
+
+    if not user_id:
+        raise ValueError(f"Missing user_id for user: {username}")
+
+    # 1. Enrich Data (Get Bio and Tweets)
+    bio, recent_tweets = enrich_user_with_details(user_id)
+
+    # 2. Classify (Using the Party Logic)
+    party, confidence, reasoning, response_time = classify_with_deepseek(
+        name=name,
+        username=username,
+        bio=bio,
+        recent_tweets=recent_tweets
+    )
+
+    # 3. Construct the Document Dictionary
+    doc = {
+        "user_id": user_id,
+        "username": username,
+        "name": name,
+        "party": party,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "tweet_count": user.get("doc_count", 0),
+        "user_bio": bio,
+        # Save up to 1200 characters of the sample tweets
+        "sample_tweets": recent_tweets[:1200] if recent_tweets else "",
+        "classified_at": datetime.utcnow().isoformat(),
+        "classification_run_id": run_id,
+        "api_response_time_ms": response_time,
+    }
+
+    return doc
+
+# ====== PARALLEL CLASSIFICATION ======
+def classify_users_parallel(users: List[Dict], run_id: str) -> List[Dict]:
+    """Classify users in parallel with progress tracking"""
+    classified = []
+    logger.info(f"🚀 Starting parallel classification with {MAX_WORKERS} workers...")
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_party = {}
-        
-        for party, data in topics.items():
-            posts = data['posts']
-            if not posts:
-                continue
-            future = executor.submit(
-                analyze_stance_for_party, 
-                posts, 
-                party, 
-                proto_emb_all[party], 
-                use_deepseek
-            )
-            future_to_party[future] = party
-        
-        for future in tqdm(as_completed(future_to_party), total=len(future_to_party), 
-                          desc="Analyzing parties"):
-            party = future_to_party[future]
+        # Submit tasks; keep mapping of future -> original_user for safe error reporting
+        futures = {executor.submit(classify_user, user, run_id): user for user in users}
+
+        for future in tqdm(as_completed(futures), total=len(users), desc="Classifying users", unit="user"):
+            original_user = futures.get(future) or {}
+            username_safe = original_user.get("username") if isinstance(original_user, dict) else None
             try:
-                analysis = future.result()
-                all_analysis[party] = analysis
-                logger.info(f"✅ Completed analysis for '{party}'")
+                result = future.result()
+                classified.append(result)
+                # Jitter delay
+                time.sleep(random.uniform(0.1, 0.5))
             except Exception as e:
-                logger.error(f"❌ Error analyzing '{party}': {e}")
-                all_analysis[party] = {'counts': Counter(), 'results': []}
-    
-    return all_analysis
+                # Avoid calling .get on None; use safe defaults
+                try:
+                    user_id_safe = original_user.get("user_id") if isinstance(original_user, dict) else None
+                    username_safe = original_user.get("username") if isinstance(original_user, dict) else "unknown"
+                except Exception:
+                    user_id_safe = None
+                    username_safe = "unknown"
 
+                logger.error(f"❌ Failed to classify @{username_safe}: {e}")
+                # Add fallback so we don't lose the record
+                classified.append({
+                    "user_id": user_id_safe,
+                    "username": username_safe,
+                    "party": "Unknown",
+                    "reasoning": f"System Error: {str(e)}",
+                    "classification_run_id": run_id,
+                    "classified_at": datetime.utcnow().isoformat()
+                })
+
+    return classified
 # ====== SAVE TO OPENSEARCH ======
-def save_to_opensearch(all_party_analysis: Dict[str, Dict], run_id: str):
-    """Save stance analysis results to OpenSearch index."""
-    logger.info(f"\n💾 Saving results to OpenSearch index '{STANCE_INDEX}'...")
-    
-    actions = []
-    timestamp = datetime.utcnow().isoformat()
-    
-    for party, analysis in all_party_analysis.items():
-        for result in analysis['results']:
-            doc = {
-                "_index": STANCE_INDEX,
-                "_source": {
-                    "original_post_id": result['id'],
-                    "post_text": result['text'],
-                    "party": party,
-                    "stance_label": result['label'],
-                    "confidence": result['confidence'],
-                    "classification_method": result['reason'].split('(')[0],
-                    "similarity_score": result.get('score', 0.0),
-                    "matched_keywords": result.get('matched_keywords', []),
-                    "timestamp": timestamp,
-                    "analysis_run_id": run_id
-                }
-            }
-            actions.append(doc)
-    
-    if actions:
-        try:
-            success, failed = helpers.bulk(es, actions, chunk_size=500, request_timeout=60)
-            logger.info(f"✅ Successfully indexed {success} documents")
-            if failed:
-                logger.warning(f"⚠️  Failed to index {len(failed)} documents")
-        except Exception as e:
-            logger.error(f"❌ Error during bulk indexing: {e}")
-    else:
-        logger.warning("⚠️  No documents to index")
+def save_classifications_bulk(classified_users: List[Dict]):
+    """Save classifications to OpenSearch in bulk"""
+    if not classified_users:
+        logger.warning("⚠️  No classifications to save")
+        return
+    logger.info(f"💾 Saving {len(classified_users)} classifications to '{TARGET_INDEX}'...")
 
-# ====== SUMMARY ======
-def print_stance_summary(all_party_analysis: Dict[str, Dict], show_samples: bool = True):
-    """Print analysis summary."""
-    print("\n" + "="*80)
-    print("📢 STANCE ANALYSIS SUMMARY")
-    print("="*80)
-    
-    for party, analysis in all_party_analysis.items():
-        counts = analysis['counts']
-        total = sum(counts.values())
-        
-        if total == 0:
-            print(f"\n🎯 Party: {party}")
-            print(f"   ⚠️  No relevant posts found")
-            continue
-            
-        support_pct = (counts.get('with', 0) / total) * 100
-        oppose_pct = (counts.get('against', 0) / total) * 100
-        neutral_pct = (counts.get('neutral', 0) / total) * 100
-        
-        print(f"\n{'='*80}")
-        print(f"🎯 PARTY: {party}")
-        print(f"{'='*80}")
-        print(f"📊 Total Posts: {total}")
-        print(f"   ✅ With:    {counts.get('with',0):4d} ({support_pct:5.1f}%)")
-        print(f"   ❌ Against: {counts.get('against',0):4d} ({oppose_pct:5.1f}%)")
-        print(f"   ⚪ Neutral: {counts.get('neutral',0):4d} ({neutral_pct:5.1f}%)")
-        
-        if show_samples:
-            print(f"\n📝 Sample Posts:")
-            results = analysis['results']
-            for label_type in ['with', 'against', 'neutral']:
-                label_posts = [r for r in results if r['label'] == label_type][:3]
-                if label_posts:
-                    emoji_map = {'with': '✅', 'against': '❌', 'neutral': '⚪'}
-                    print(f"\n{emoji_map[label_type]} {label_type.upper()} samples:")
-                    for idx, post in enumerate(label_posts, 1):
-                        print(f"   {idx}. [{post['confidence']}] {post['text'][:100]}...")
-        
-        print(f"{'='*80}\n")
+    actions = [
+        {"_index": TARGET_INDEX, "_id": user["user_id"], "_source": user} for user in classified_users
+    ]
+    try:
+        success, failed = helpers.bulk(
+            es,
+            actions,
+            chunk_size=100,
+            request_timeout=120,
+            raise_on_error=False,
+        )
+        logger.info(f"✅ Bulk save reported success={success}")
+        if failed:
+            logger.warning(f"⚠️  Some bulk items failed (see server logs)")
+    except Exception as e:
+        logger.error(f"❌ Bulk save error: {e}")
 
-# ====== MAIN ======
-if __name__ == "__main__":
-    import time
+
+# ====== PRINT STATISTICS ======
+def print_classification_summary(classified_users: List[Dict]):
+    """Print detailed classification statistics"""
+    party_counts = Counter()
+    confidence_counts = Counter()
+    avg_response_times = defaultdict(list)
+
+    for user in classified_users:
+        party_counts[user.get("party", "Unknown")] += 1
+        confidence_counts[user.get("confidence", "low")] += 1
+        avg_response_times[user.get("confidence", "low")].append(user.get("api_response_time_ms", 0))
+
+    total = len(classified_users)
+    print("\n" + "=" * 80)
+    print("📊 CLASSIFICATION SUMMARY")
+    print("=" * 80)
+    print(f"\n📈 Total Users Classified: {total}")
+
+    print("\n🎯 By Political Party:")
+    print("-" * 60)
+    for party, count in sorted(party_counts.items(), key=lambda x: x[1], reverse=True):
+        percentage = (count / total) * 100 if total else 0
+        bar = "█" * int(percentage / 2)
+        print(f"  {party:30s} │ {count:4d} ({percentage:5.1f}%) {bar}")
+
+    print("\n🎯 By Confidence Level:")
+    print("-" * 60)
+    for conf, count in sorted(confidence_counts.items(), key=lambda x: x[1], reverse=True):
+        percentage = (count / total) * 100 if total else 0
+        avg_time = int(sum(avg_response_times[conf]) / len(avg_response_times[conf])) if avg_response_times[conf] else 0
+        print(f"  {conf:10s} │ {count:4d} ({percentage:5.1f}%) │ Avg: {avg_time}ms")
+
+    print("\n📝 Sample Classifications:")
+    print("-" * 80)
+    for party in list(party_counts.keys())[:5]:
+        samples = [u for u in classified_users if u.get("party") == party][:2]
+        if samples:
+            print(f"\n  {party}:")
+            for s in samples:
+                print(f"    • @{s.get('username')} ({s.get('name')})")
+                print(f"      └─ {s.get('reasoning', '')[:150]}...")
+    print("\n" + "=" * 80)
+
+
+# ====== PRINT CLASSIFICATION RESULTS ======
+def print_classification_results(classified_users: List[Dict]):
+    """Print detailed classification results for each user."""
+    print("\n" + "=" * 80)
+    print("📋 DETAILED CLASSIFICATION RESULTS")
+    print("=" * 80)
+
+    for user in classified_users:
+        user_id = user.get("user_id", "N/A")
+        username = user.get("username", "N/A")
+        party = user.get("party", "Unknown")
+        confidence = user.get("confidence", "low")
+        reasoning = user.get("reasoning", "No reasoning provided")
+
+        print(f"\n👤 User: @{username} (ID: {user_id})")
+        print(f"   - Party: {party}")
+        print(f"   - Confidence: {confidence}")
+        print(f"   - Reasoning: {reasoning}")
+
+
+# ====== VALIDATE INDEX MAPPING ======
+def validate_index_mapping(index: str, fields: List[str]) -> None:
+    """
+    Validate that the required fields exist in the index mapping and are properly configured.
+    Logs warnings for any missing or improperly mapped fields.
+    """
+    try:
+        mapping = es_call_with_retries(es.indices.get_mapping, index=index)
+        properties = mapping.get(index, {}).get("mappings", {}).get("properties", {})
+
+        for field in fields:
+            if field not in properties:
+                logger.warning(f"⚠️  Field '{field}' is missing in the index mapping for '{index}'.")
+            elif properties[field].get("type") != "date":
+                logger.warning(f"⚠️  Field '{field}' in index '{index}' is not mapped as a 'date' field.")
+            else:
+                logger.info(f"✅ Field '{field}' is correctly mapped as 'date' in index '{index}'.")
+    except Exception as e:
+        logger.error(f"❌ Failed to validate index mapping for '{index}': {e}")
+
+# Validate the required fields in the source index
+validate_index_mapping(SOURCE_INDEX, ["created_at", "post_created_at", "timestamp"])
+
+# ====== MAIN EXECUTION ======
+def main():
+    """Main execution pipeline"""
     start_time = time.time()
-    
-    # Create stance analysis index
-    create_stance_index()
-    
-    # Generate unique run ID
     run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-    logger.info(f"🆔 Analysis Run ID: {run_id}")
-    
-    # Use party names from config
-    parties = list(PARTY_CONFIG.keys())
-    logger.info(f"📋 Analyzing parties: {', '.join(parties)}")
-    
-    # Fetch posts
-    logger.info("📥 Fetching posts...")
-    topics = fetch_posts_for_parties_texts(parties, max_per_party=500)
-    
-    # Precompute prototype embeddings
-    logger.info("🔧 Computing prototype embeddings...")
-    proto_emb_all = embed_prototypes(parties)
-    
-    # Analyze with parallel processing
-    logger.info("🚀 Starting parallel stance analysis...")
-    all_analysis = analyze_all_parties_parallel(topics, proto_emb_all, use_deepseek=False)
-    
-    # Save to OpenSearch
-    save_to_opensearch(all_analysis, run_id)
-    
-    # Print summary
-    print_stance_summary(all_analysis, show_samples=True)
-    
+    logger.info(f"🆔 Classification Run ID: {run_id}")
+
+    create_classified_index(force_recreate=False)
+
+    users = fetch_all_users(limit=MAX_USERS)
+    if not users:
+        logger.error("❌ No users found to classify")
+        return
+
+    # Filter out invalid entries (None or missing user_id)
+    total_before = len(users)
+    users = [u for u in users if isinstance(u, dict) and u.get("user_id")]
+    filtered_out = total_before - len(users)
+    if filtered_out:
+        logger.warning(f"⚠️  Filtered out {filtered_out} invalid user entries before classification")
+
+    classified = classify_users_parallel(users, run_id)
+    save_classifications_bulk(classified)
+    print_classification_summary(classified)
+    print_classification_results(classified)
+
     elapsed = time.time() - start_time
-    logger.info(f"\n⏱️  Total execution time: {elapsed:.2f} seconds")
-    logger.info(f"✅ Results saved to OpenSearch index: '{STANCE_INDEX}'")
-    logger.info(f"🔍 Query example: GET {STANCE_INDEX}/_search?q=analysis_run_id:{run_id}")
+    per_user = elapsed / len(users) if users else 0
+    logger.info(f"\n⏱️  Total execution time: {elapsed:.1f}s ({per_user:.2f}s per user)")
+    logger.info(f"✅ Results saved to OpenSearch index: '{TARGET_INDEX}'")
+    logger.info(f"🔍 Query example: GET {TARGET_INDEX}/_search?q=classification_run_id:{run_id}")
+
+
+# ====== ENTRY POINT ======
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.warning("\n⚠️  Classification interrupted by user")
+    except Exception as e:
+        logger.error(f"\n❌ Fatal error: {e}", exc_info=True)
+        raise

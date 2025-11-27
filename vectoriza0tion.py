@@ -856,7 +856,7 @@ class TopicGenerator:
             topic = topic.strip('[]').strip('()').strip('{}')
             
             # 4. Take only first line (in case of multi-line response)
-            topic = topic.split("\n")[0].strip()
+            # topic = topic.split("\n")[0].strip()
             
             # 5. Remove ALL forms of ellipsis and incomplete markers
             topic = re.sub(r'\.{2,}$', '', topic)  # Remove trailing ...
@@ -1146,7 +1146,7 @@ class IndexingManager:
             keywords = TextProcessor.extract_keywords(cluster_texts, top_n=self.config.top_keywords)
             size = len(members)
 
-            logger.info(f"Cluster {i}: size={size}, topic={topic[:60]}...")
+            logger.info(f"Cluster {i}: size={size}, topic={topic}...")
 
             for m in members:
                 actions.append({
