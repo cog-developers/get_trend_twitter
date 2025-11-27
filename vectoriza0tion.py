@@ -1114,7 +1114,7 @@ class IndexingManager:
         self.os_client = os_client
         self.config = config
         self.topic_gen = TopicGenerator(config)
-        self.target_index = os.getenv("TARGET_INDEX", "clustered-tweets-index")  # New index for clustered data
+        self.target_index = os.getenv("TARGET_INDEX", "clustered-tweets-index")
 
     def create_target_index(self):
         """Create the target index with the required mappings."""
@@ -1130,9 +1130,12 @@ class IndexingManager:
                     "cluster_id": {"type": "keyword"},
                     "cluster_size": {"type": "integer"},
                     "cluster_keywords": {"type": "keyword"},
+                    "representative_texts": {"type": "text"},  # Sample texts from cluster
+                    "member_ids": {"type": "keyword"},  # IDs of all documents in cluster
+                    "authors": {"type": "keyword"},  # Unique authors in cluster
                     "fetched_at": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
                     "updated_at": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
-                    "timestamp": {"type": "date", "format": "strict_date_optional_time||epoch_millis"}  # Added timestamp field
+                    "timestamp": {"type": "date", "format": "strict_date_optional_time||epoch_millis"}
                 }
             },
         }
@@ -1152,14 +1155,13 @@ class IndexingManager:
         merged_struct: Dict[int, Dict],
         docs: List[Dict]
     ):
-        """Update all documents with cluster information in the target index."""
+        """Create ONE document per cluster in the target index."""
         logger.info("\n" + "="*70)
         logger.info("📊 CLUSTER SUMMARY & INDEXING")
         logger.info("="*70)
 
         actions = []
-        clustered_ids = set()
-        total_updated = 0
+        total_clusters = 0
 
         # Ensure the target index exists
         self.create_target_index()
@@ -1176,43 +1178,60 @@ class IndexingManager:
             embeds_local = cdata["embeds"]
             centroid = cdata["centroid"]
 
+            # Extract cluster information
             cluster_texts = [m["text"] for m in members]
             topic = self.topic_gen.get_cluster_topic(members, embeds_local, centroid)
             keywords = TextProcessor.extract_keywords(cluster_texts, top_n=self.config.top_keywords)
             size = len(members)
+            
+            # Get representative texts (top 5 most central)
+            representative_texts = self.topic_gen.select_representative_texts(
+                members, embeds_local, centroid, top_k=5
+            )
+            
+            # Extract metadata
+            member_ids = [m["id"] for m in members]
+            authors = list(set([m.get("author") for m in members if m.get("author")]))
+            
+            logger.info(f"Cluster {i}: size={size}, topic={topic[:60]}...")
 
-            logger.info(f"Cluster {i}: size={size}, topic={topic}...")
+            # Create ONE document for this cluster
+            cluster_doc = {
+                "group_topic": topic,
+                "cluster_id": f"group_{i}",
+                "cluster_size": size,
+                "cluster_keywords": keywords,
+                "representative_texts": representative_texts,
+                "member_ids": member_ids,
+                "authors": authors,
+                "created_at_min": created_at_min,
+                "created_at_max": created_at_max,
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            }
 
-            for m in members:
-                actions.append({
-                    "_op_type": "index",  # Use "index" to insert into the new index
-                    "_index": self.target_index,
-                    "_id": m["id"],
-                    "_source": {
-                        "group_topic": topic,
-                        "cluster_id": f"group_{i}",
-                        "cluster_size": size,
-                        "cluster_keywords": keywords,
-                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # Added timestamp field
-                    }
-                })
-                clustered_ids.add(m["id"])
-                total_updated += 1
+            actions.append({
+                "_op_type": "index",
+                "_index": self.target_index,
+                "_id": f"cluster_{i}",  # Unique ID for the cluster document
+                "_source": cluster_doc
+            })
+            
+            total_clusters += 1
 
-                if len(actions) >= self.config.batch_size:
-                    success, _ = self.os_client.bulk_update(actions)
-                    actions = []
+            # Batch insert
+            if len(actions) >= self.config.batch_size:
+                success, _ = self.os_client.bulk_update(actions)
+                logger.info(f"   • Indexed {len(actions)} clusters")
+                actions = []
 
         # Final batch
         if actions:
             success, _ = self.os_client.bulk_update(actions)
+            logger.info(f"   • Indexed {len(actions)} clusters (final batch)")
 
-        logger.info(f"\n✅ Total updated: {total_updated} documents in target index '{self.target_index}'")
-        logger.info(f"   • Clustered: {len(clustered_ids)}")
+        logger.info(f"\n✅ Total clusters indexed: {total_clusters} in target index '{self.target_index}'")
         logger.info("="*70)
-
-
 # ====== PIPELINE ORCHESTRATOR ======
 class ClusteringPipeline:
     """Main pipeline orchestrator"""
