@@ -75,7 +75,7 @@ class Config:
             opensearch_node=os.getenv("OPENSEARCH_NODE"),
             opensearch_username=os.getenv("OPENSEARCH_USERNAME"),
             opensearch_password=os.getenv("OPENSEARCH_PASSWORD"),
-            source_index=os.getenv("OPENSEARCH_INDEX", "searched-tweets-index"),
+            source_index=os.getenv("OPENSEARCH_INDEX", "user-input-posts"),
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
             deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-reasoner"),
             min_cluster_size=int(os.getenv("MIN_CLUSTER_SIZE", "10")),

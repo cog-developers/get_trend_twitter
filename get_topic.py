@@ -22,7 +22,7 @@ load_dotenv()
 OPENSEARCH_NODE = os.getenv("OPENSEARCH_NODE")
 OPENSEARCH_USERNAME = os.getenv("OPENSEARCH_USERNAME")
 OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD")
-SOURCE_INDEX = os.getenv("OPENSEARCH_INDEX", "searched-tweets-index")
+SOURCE_INDEX = os.getenv("OPENSEARCH_INDEX", "user-input-posts")
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
