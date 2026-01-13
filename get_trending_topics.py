@@ -449,29 +449,38 @@ def save_trending_topics(client: OpenSearch, topics: List[Dict]):
                     "member_ids": {"type": "keyword"},
                     "generated_at": {"type": "date"},
                     "timestamp": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
-                    "rank": {"type": "integer"}
+                    "rank": {"type": "integer"},
+                    "user_input_id": {"type": "keyword"},
+                    "filtered_sources": {"type": "keyword"}
                 }
             }
         }
         client.indices.create(index=TRENDING_INDEX, body=mapping)
         logger.info(f"✅ Created index: {TRENDING_INDEX}")
     else:
-        # Index exists - check if timestamp field exists and add it if missing
+        # Index exists - check if new fields exist and add them if missing
         try:
             current_mapping = client.indices.get_mapping(index=TRENDING_INDEX)
             properties = current_mapping.get(TRENDING_INDEX, {}).get("mappings", {}).get("properties", {})
             
+            missing_fields = {}
+            
             if "timestamp" not in properties:
-                logger.info(f"📝 Adding 'timestamp' field to existing index: {TRENDING_INDEX}")
-                update_mapping = {
-                    "properties": {
-                        "timestamp": {"type": "date", "format": "strict_date_optional_time||epoch_millis"}
-                    }
-                }
+                missing_fields["timestamp"] = {"type": "date", "format": "strict_date_optional_time||epoch_millis"}
+            
+            if "user_input_id" not in properties:
+                missing_fields["user_input_id"] = {"type": "keyword"}
+            
+            if "filtered_sources" not in properties:
+                missing_fields["filtered_sources"] = {"type": "keyword"}
+            
+            if missing_fields:
+                logger.info(f"📝 Adding missing fields to existing index: {TRENDING_INDEX}")
+                update_mapping = {"properties": missing_fields}
                 client.indices.put_mapping(index=TRENDING_INDEX, body=update_mapping)
-                logger.info(f"✅ Updated index mapping with 'timestamp' field")
+                logger.info(f"✅ Updated index mapping with fields: {list(missing_fields.keys())}")
             else:
-                logger.info(f"ℹ️  Index '{TRENDING_INDEX}' already has 'timestamp' field")
+                logger.info(f"ℹ️  Index '{TRENDING_INDEX}' already has all required fields")
         except Exception as e:
             logger.warning(f"⚠️  Could not update mapping: {e}")
     
