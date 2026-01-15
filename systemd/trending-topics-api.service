@@ -6,12 +6,12 @@ After=network.target
 Type=notify
 User=www-data
 Group=www-data
-WorkingDirectory=/opt/trending-topics
-Environment="PATH=/opt/trending-topics/venv/bin"
-EnvironmentFile=/opt/trending-topics/.env
+WorkingDirectory=/var/www/get_trend_twitter
+Environment="PATH=/var/www/get_trend_twitter/venv/bin"
+EnvironmentFile=/var/www/get_trend_twitter/.env
 
 # Gunicorn command
-ExecStart=/opt/trending-topics/venv/bin/gunicorn \
+ExecStart=/var/www/get_trend_twitter/venv/bin/gunicorn \
     --bind 0.0.0.0:5001 \
     --workers 4 \
     --worker-class sync \

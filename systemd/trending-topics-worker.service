@@ -7,12 +7,12 @@ Requires=rabbitmq-server.service
 Type=simple
 User=www-data
 Group=www-data
-WorkingDirectory=/opt/trending-topics
-Environment="PATH=/opt/trending-topics/venv/bin"
-EnvironmentFile=/opt/trending-topics/.env
+WorkingDirectory=/var/www/get_trend_twitter
+Environment="PATH=/var/www/get_trend_twitter/venv/bin"
+EnvironmentFile=/var/www/get_trend_twitter/.env
 
 # Run worker script
-ExecStart=/opt/trending-topics/venv/bin/python /opt/trending-topics/worker.py
+ExecStart=/var/www/get_trend_twitter/venv/bin/python /var/www/get_trend_twitter/worker.py
 
 # Restart policy
 Restart=always
