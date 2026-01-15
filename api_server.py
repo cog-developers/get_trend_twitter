@@ -580,7 +580,7 @@ def setup_rabbitmq_consumer():
     Setup RabbitMQ consumer to listen to trending-topics queue.
     Processes messages containing user-input-id and source-ids.
     """
-    rabbitmq_url = os.getenv('RABBITMQ_URL', 'amqp://admin:admin@185.217.126.143:5672')
+    rabbitmq_url = os.getenv('RABBITMQ_URL')
     queue_name = 'trending-topics'
     
     def on_message(channel, method, properties, body):
