@@ -15,8 +15,7 @@ from typing import Optional, List, Dict
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-import pika
-from pika.exceptions import AMQPConnectionError
+# RabbitMQ imports removed - worker.py handles RabbitMQ consumption
 
 # Import trending topics functions
 from get_trending_topics import (
@@ -574,107 +573,9 @@ def fetch_posts_with_filters(
 
 
 # ====== RABBITMQ CONSUMER ======
-
-def setup_rabbitmq_consumer():
-    """
-    Setup RabbitMQ consumer to listen to trending-topics queue.
-    Processes messages containing user-input-id and source-ids.
-    """
-    rabbitmq_url = os.getenv('RABBITMQ_URL')
-    queue_name = 'trending-topics'
-    
-    def on_message(channel, method, properties, body):
-        """Process incoming message from RabbitMQ queue"""
-        try:
-            logger.info(f"📨 Received message from RabbitMQ queue: {queue_name}")
-            
-            # Parse message
-            message = json.loads(body)
-            user_input_id = message.get('user-input-id') or message.get('user_input_id')
-            source_ids = message.get('source-ids') or message.get('source_ids')
-            min_cluster_size = message.get('min_cluster_size', 5)
-            save_to_index = message.get('save_to_index', True)
-            
-            logger.info(f"📥 Processing request: user_input_id={user_input_id}, source_ids={source_ids}")
-            
-            # Generate job ID
-            job_id = generate_job_id(user_input_id, source_ids)
-            
-            # Check if job already exists
-            existing_job = get_job_status(job_id)
-            if existing_job and existing_job["status"] in ["pending", "processing"]:
-                logger.info(f"⏳ Job {job_id} already in progress, skipping")
-                channel.basic_ack(delivery_tag=method.delivery_tag)
-                return
-            
-            # Create new job
-            job = create_job(job_id, user_input_id, source_ids)
-            
-            # Start background processing
-            thread = threading.Thread(
-                target=process_trending_topics_job,
-                args=(job_id, user_input_id, source_ids, min_cluster_size, save_to_index),
-                daemon=True
-            )
-            thread.start()
-            
-            logger.info(f"🚀 Started background job from RabbitMQ: {job_id}")
-            
-            # Acknowledge message
-            channel.basic_ack(delivery_tag=method.delivery_tag)
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ Invalid JSON in message: {e}")
-            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-        except Exception as e:
-            logger.error(f"❌ Error processing RabbitMQ message: {e}", exc_info=True)
-            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-    
-    def connect_and_consume():
-        """Connect to RabbitMQ and start consuming messages"""
-        while True:
-            try:
-                logger.info(f"🔌 Connecting to RabbitMQ: {rabbitmq_url.split('@')[1] if '@' in rabbitmq_url else rabbitmq_url}")
-                
-                # Parse connection URL
-                connection_params = pika.URLParameters(rabbitmq_url)
-                connection = pika.BlockingConnection(connection_params)
-                channel = connection.channel()
-                
-                # Declare queue (create if doesn't exist)
-                channel.queue_declare(queue=queue_name, durable=True)
-                
-                # Set QoS to process one message at a time
-                channel.basic_qos(prefetch_count=1)
-                
-                # Set up consumer
-                channel.basic_consume(
-                    queue=queue_name,
-                    on_message_callback=on_message
-                )
-                
-                logger.info(f"✅ RabbitMQ consumer started. Listening to queue: {queue_name}")
-                logger.info(f"⏳ Waiting for messages. To exit press CTRL+C")
-                
-                # Start consuming
-                channel.start_consuming()
-                
-            except AMQPConnectionError as e:
-                logger.error(f"❌ RabbitMQ connection error: {e}. Retrying in 10 seconds...")
-                time.sleep(10)
-            except KeyboardInterrupt:
-                logger.info("🛑 RabbitMQ consumer stopped by user")
-                if 'connection' in locals() and not connection.is_closed:
-                    connection.close()
-                break
-            except Exception as e:
-                logger.error(f"❌ Unexpected error in RabbitMQ consumer: {e}", exc_info=True)
-                time.sleep(10)
-    
-    # Start consumer in background thread
-    consumer_thread = threading.Thread(target=connect_and_consume, daemon=True)
-    consumer_thread.start()
-    logger.info("🐰 RabbitMQ consumer thread started")
+# NOTE: RabbitMQ consumer has been moved to worker.py
+# The API server no longer handles RabbitMQ consumption.
+# Use the separate worker service (worker.py) with systemd for RabbitMQ processing.
 
 
 # ====== MAIN ======
@@ -688,8 +589,8 @@ if __name__ == '__main__':
     logger.info(f"   GET  /api/trending-topics/results - Get trending topics from index")
     logger.info(f"   GET  /api/trending-topics/status - Check job status")
     logger.info(f"   GET  /health - Health check")
-    
-    # Start RabbitMQ consumer
-    setup_rabbitmq_consumer()
+    logger.info(f"")
+    logger.info(f"⚠️  NOTE: RabbitMQ consumer runs separately via worker.py")
+    logger.info(f"   Start worker with: systemctl start trending-topics-worker")
     
     app.run(host=host, port=port, debug=False)
