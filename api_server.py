@@ -1,3 +1,4 @@
+
 """
 API Server for Trending Topics Generation
 Provides REST API endpoints to generate trending topics with filtering options.
@@ -14,6 +15,8 @@ from typing import Optional, List, Dict
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
+import pika
+from pika.exceptions import AMQPConnectionError
 
 # Import trending topics functions
 from get_trending_topics import (
@@ -258,90 +261,12 @@ def check_job_status():
 @app.route('/api/trending-topics/results', methods=['GET'])
 def get_trending_topics_results():
     """
-    Get the results of a completed trending topics generation job.
+    Get trending topics results directly from OpenSearch based on user_input_id and source_ids.
+    No longer uses job_id - queries OpenSearch index directly.
     
     Query Parameters:
-    - user_input_id: User input ID used in the job
+    - user_input_id: User input ID to filter by
     - source_ids: Comma-separated list of source IDs (or omit for all sources)
-    
-    Returns:
-    {
-        "success": true,
-        "data": {
-            "trending_topics": [...],
-            "total_topics": 10,
-            "total_posts_processed": 1000,
-            "filters_applied": {...},
-            "generated_at": "..."
-        }
-    }
-    """
-    try:
-        user_input_id = request.args.get('user_input_id') or None
-        source_ids_param = request.args.get('source_ids', '')
-        source_ids = [s.strip() for s in source_ids_param.split(',')] if source_ids_param else None
-        
-        # Generate job ID from filters
-        job_id = generate_job_id(user_input_id, source_ids)
-        
-        job = get_job_status(job_id)
-        
-        if not job:
-            return jsonify({
-                "success": False,
-                "message": f"Job not found for user_input_id={user_input_id}, source_ids={source_ids}"
-            }), 404
-        
-        if job["status"] == "pending" or job["status"] == "processing":
-            return jsonify({
-                "success": False,
-                "message": f"Job is still {job['status']}. Please check status first.",
-                "data": {
-                    "status": job["status"],
-                    "progress": job.get("progress", 0),
-                    "check_status_url": f"/api/trending-topics/status?user_input_id={user_input_id or ''}&source_ids={','.join(source_ids) if source_ids else ''}"
-                }
-            }), 202  # Accepted but not ready
-        
-        if job["status"] == "failed":
-            return jsonify({
-                "success": False,
-                "message": "Job failed",
-                "data": {
-                    "status": "failed",
-                    "error": job.get("error", "Unknown error"),
-                    "created_at": job["created_at"],
-                    "finished_at": job.get("finished_at")
-                }
-            }), 500
-        
-        if job["status"] == "completed" and job.get("result"):
-            return jsonify({
-                "success": True,
-                "data": job["result"]
-            }), 200
-        
-        return jsonify({
-            "success": False,
-            "message": "Job completed but no results available"
-        }), 404
-        
-    except Exception as e:
-        logger.error(f"❌ Error getting results: {e}", exc_info=True)
-        return jsonify({
-            "success": False,
-            "message": f"Error getting results: {str(e)}"
-        }), 500
-
-
-@app.route('/api/trending-topics', methods=['GET'])
-def get_trending_topics():
-    """
-    Get trending topics from OpenSearch index with optional filters.
-    
-    Query Parameters:
-    - user_input_id: Filter by user_input_id
-    - source_id: Filter by source_id (can be multiple)
     - limit: Limit number of results (default: 20)
     - min_score: Minimum trending score (optional)
     
@@ -349,8 +274,9 @@ def get_trending_topics():
     {
         "success": true,
         "data": {
-            "topics": [...],
-            "total": 10
+            "trending_topics": [...],
+            "total_topics": 10,
+            "filters_applied": {...}
         }
     }
     """
@@ -361,8 +287,9 @@ def get_trending_topics():
         
         try:
             # Get query parameters
-            user_input_id = request.args.get('user_input_id')
-            source_id = request.args.getlist('source_id')  # Can have multiple
+            user_input_id = request.args.get('user_input_id') or None
+            source_ids_param = request.args.get('source_ids', '')
+            source_ids = [s.strip() for s in source_ids_param.split(',')] if source_ids_param else None
             limit = int(request.args.get('limit', 20))
             min_score = request.args.get('min_score', type=float)
             
@@ -372,12 +299,12 @@ def get_trending_topics():
             if user_input_id:
                 must_clauses.append({"term": {"user_input_id": user_input_id}})
             
-            if source_id:
-                # source_id can be a list, handle both single and multiple values
-                if isinstance(source_id, list) and len(source_id) > 0:
-                    must_clauses.append({"terms": {"filtered_sources": source_id}})
-                elif source_id:
-                    must_clauses.append({"term": {"filtered_sources": source_id}})
+            if source_ids:
+                # source_ids can be a list, handle both single and multiple values
+                if isinstance(source_ids, list) and len(source_ids) > 0:
+                    must_clauses.append({"terms": {"filtered_sources": source_ids}})
+                elif source_ids:
+                    must_clauses.append({"term": {"filtered_sources": source_ids}})
             
             query = {
                 "size": limit,
@@ -403,8 +330,12 @@ def get_trending_topics():
             return jsonify({
                 "success": True,
                 "data": {
-                    "topics": topics,
-                    "total": len(topics)
+                    "trending_topics": topics,
+                    "total_topics": len(topics),
+                    "filters_applied": {
+                        "user_input_id": user_input_id,
+                        "source_ids": source_ids
+                    }
                 }
             }), 200
             
@@ -412,11 +343,14 @@ def get_trending_topics():
             client.close()
             
     except Exception as e:
-        logger.error(f"❌ Error fetching trending topics: {e}", exc_info=True)
+        logger.error(f"❌ Error getting results: {e}", exc_info=True)
         return jsonify({
             "success": False,
-            "message": f"Error fetching topics: {str(e)}"
+            "message": f"Error getting results: {str(e)}"
         }), 500
+
+
+# GET endpoint removed - now using RabbitMQ consumer instead
 
 
 # ====== BACKGROUND PROCESSING ======
@@ -639,6 +573,110 @@ def fetch_posts_with_filters(
         raise
 
 
+# ====== RABBITMQ CONSUMER ======
+
+def setup_rabbitmq_consumer():
+    """
+    Setup RabbitMQ consumer to listen to trending-topics queue.
+    Processes messages containing user-input-id and source-ids.
+    """
+    rabbitmq_url = os.getenv('RABBITMQ_URL', 'amqp://admin:admin@185.217.126.143:5672')
+    queue_name = 'trending-topics'
+    
+    def on_message(channel, method, properties, body):
+        """Process incoming message from RabbitMQ queue"""
+        try:
+            logger.info(f"📨 Received message from RabbitMQ queue: {queue_name}")
+            
+            # Parse message
+            message = json.loads(body)
+            user_input_id = message.get('user-input-id') or message.get('user_input_id')
+            source_ids = message.get('source-ids') or message.get('source_ids')
+            min_cluster_size = message.get('min_cluster_size', 5)
+            save_to_index = message.get('save_to_index', True)
+            
+            logger.info(f"📥 Processing request: user_input_id={user_input_id}, source_ids={source_ids}")
+            
+            # Generate job ID
+            job_id = generate_job_id(user_input_id, source_ids)
+            
+            # Check if job already exists
+            existing_job = get_job_status(job_id)
+            if existing_job and existing_job["status"] in ["pending", "processing"]:
+                logger.info(f"⏳ Job {job_id} already in progress, skipping")
+                channel.basic_ack(delivery_tag=method.delivery_tag)
+                return
+            
+            # Create new job
+            job = create_job(job_id, user_input_id, source_ids)
+            
+            # Start background processing
+            thread = threading.Thread(
+                target=process_trending_topics_job,
+                args=(job_id, user_input_id, source_ids, min_cluster_size, save_to_index),
+                daemon=True
+            )
+            thread.start()
+            
+            logger.info(f"🚀 Started background job from RabbitMQ: {job_id}")
+            
+            # Acknowledge message
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Invalid JSON in message: {e}")
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        except Exception as e:
+            logger.error(f"❌ Error processing RabbitMQ message: {e}", exc_info=True)
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+    
+    def connect_and_consume():
+        """Connect to RabbitMQ and start consuming messages"""
+        while True:
+            try:
+                logger.info(f"🔌 Connecting to RabbitMQ: {rabbitmq_url.split('@')[1] if '@' in rabbitmq_url else rabbitmq_url}")
+                
+                # Parse connection URL
+                connection_params = pika.URLParameters(rabbitmq_url)
+                connection = pika.BlockingConnection(connection_params)
+                channel = connection.channel()
+                
+                # Declare queue (create if doesn't exist)
+                channel.queue_declare(queue=queue_name, durable=True)
+                
+                # Set QoS to process one message at a time
+                channel.basic_qos(prefetch_count=1)
+                
+                # Set up consumer
+                channel.basic_consume(
+                    queue=queue_name,
+                    on_message_callback=on_message
+                )
+                
+                logger.info(f"✅ RabbitMQ consumer started. Listening to queue: {queue_name}")
+                logger.info(f"⏳ Waiting for messages. To exit press CTRL+C")
+                
+                # Start consuming
+                channel.start_consuming()
+                
+            except AMQPConnectionError as e:
+                logger.error(f"❌ RabbitMQ connection error: {e}. Retrying in 10 seconds...")
+                time.sleep(10)
+            except KeyboardInterrupt:
+                logger.info("🛑 RabbitMQ consumer stopped by user")
+                if 'connection' in locals() and not connection.is_closed:
+                    connection.close()
+                break
+            except Exception as e:
+                logger.error(f"❌ Unexpected error in RabbitMQ consumer: {e}", exc_info=True)
+                time.sleep(10)
+    
+    # Start consumer in background thread
+    consumer_thread = threading.Thread(target=connect_and_consume, daemon=True)
+    consumer_thread.start()
+    logger.info("🐰 RabbitMQ consumer thread started")
+
+
 # ====== MAIN ======
 if __name__ == '__main__':
     port = int(os.getenv('API_PORT', 5001))
@@ -647,7 +685,11 @@ if __name__ == '__main__':
     logger.info(f"🚀 Starting API server on {host}:{port}")
     logger.info(f"📡 Endpoints:")
     logger.info(f"   POST /api/trending-topics - Generate trending topics with filters")
-    logger.info(f"   GET  /api/trending-topics - Get trending topics from index")
+    logger.info(f"   GET  /api/trending-topics/results - Get trending topics from index")
+    logger.info(f"   GET  /api/trending-topics/status - Check job status")
     logger.info(f"   GET  /health - Health check")
+    
+    # Start RabbitMQ consumer
+    setup_rabbitmq_consumer()
     
     app.run(host=host, port=port, debug=False)
