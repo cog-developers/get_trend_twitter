@@ -8,7 +8,7 @@ import os
 import re
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import Counter
 from typing import List, Dict, Optional
 import logging
@@ -57,6 +57,7 @@ HDBSCAN_MIN_SAMPLES = int(os.getenv("HDBSCAN_MIN_SAMPLES", "3"))
 PCA_TARGET_DIM = int(os.getenv("PCA_TARGET_DIM", "100"))
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
+EMBEDDING_DIM = 512  # distiluse-base-multilingual-cased-v2 output dimension
 
 ARABIC_STOPWORDS = {
     "و", "في", "من", "على", "إلى", "مع", "عن", "ما", "لا",
@@ -100,6 +101,73 @@ def create_opensearch_client() -> OpenSearch:
         logger.error(f"❌ OpenSearch connection failed: {e}")
         raise
 
+
+def ensure_embedding_mapping(client: OpenSearch):
+    """Ensure the embedding field exists in the source index mapping."""
+    try:
+        mapping = client.indices.get_mapping(index=SOURCE_INDEX)
+        properties = mapping.get(SOURCE_INDEX, {}).get("mappings", {}).get("properties", {})
+
+        if "embedding" not in properties:
+            logger.info(f"📝 Adding 'embedding' field to index {SOURCE_INDEX}...")
+            update_mapping = {
+                "properties": {
+                    "embedding": {
+                        "type": "dense_vector",
+                        "dims": EMBEDDING_DIM,
+                        "index": False  # We don't need KNN search, just storage
+                    },
+                    "embedding_updated_at": {
+                        "type": "date"
+                    }
+                }
+            }
+            client.indices.put_mapping(index=SOURCE_INDEX, body=update_mapping)
+            logger.info("✅ Added embedding field to index mapping")
+        else:
+            logger.info("ℹ️ Embedding field already exists in index mapping")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not update mapping for embeddings: {e}")
+
+
+def save_embeddings_to_opensearch(client: OpenSearch, docs_with_embeddings: List[Dict]):
+    """Save computed embeddings back to OpenSearch for caching."""
+    if not docs_with_embeddings:
+        return
+
+    logger.info(f"💾 Saving {len(docs_with_embeddings)} embeddings to OpenSearch...")
+
+    actions = []
+    for doc in docs_with_embeddings:
+        if "new_embedding" in doc and doc["new_embedding"] is not None:
+            actions.append({
+                "_op_type": "update",
+                "_index": SOURCE_INDEX,
+                "_id": doc["id"],
+                "doc": {
+                    "embedding": doc["new_embedding"].tolist() if hasattr(doc["new_embedding"], 'tolist') else doc["new_embedding"],
+                    "embedding_updated_at": datetime.now(timezone.utc).isoformat()
+                }
+            })
+
+    if not actions:
+        logger.info("ℹ️ No new embeddings to save")
+        return
+
+    try:
+        success, errors = helpers.bulk(
+            client,
+            actions,
+            chunk_size=100,
+            request_timeout=120,
+            raise_on_error=False
+        )
+        logger.info(f"✅ Saved {success} embeddings to OpenSearch")
+        if errors:
+            logger.warning(f"⚠️ {len(errors)} errors while saving embeddings")
+    except Exception as e:
+        logger.error(f"❌ Error saving embeddings: {e}")
+
 # ====== TEXT PROCESSING ======
 def clean_text(text: str) -> str:
     """Clean and normalize Arabic text."""
@@ -140,16 +208,21 @@ def clean_text(text: str) -> str:
 
 # ====== FETCH POSTS ======
 def fetch_posts(client: OpenSearch) -> List[Dict]:
-    """Fetch posts from user-input-posts index."""
+    """Fetch posts from user-input-posts index, including cached embeddings."""
     logger.info(f"📥 Fetching posts from index: {SOURCE_INDEX}")
-    
+
     docs = []
+    cached_count = 0
     try:
         query = {
             "query": {"match_all": {}},
-            "_source": ["post_text", "text", "content", "created_at", "timestamp", "author", "likes", "retweets", "replies"]
+            "_source": [
+                "post_text", "text", "content", "created_at", "timestamp",
+                "author", "likes", "retweets", "replies",
+                "embedding", "embedding_updated_at"  # Include cached embeddings
+            ]
         }
-        
+
         for hit in helpers.scan(
             client,
             query=query,
@@ -162,17 +235,24 @@ def fetch_posts(client: OpenSearch) -> List[Dict]:
                 src = hit.get("_source", {})
                 # Try multiple field names for post text
                 text = (
-                    src.get("post_text") or 
-                    src.get("text") or 
-                    src.get("content") or 
+                    src.get("post_text") or
+                    src.get("text") or
+                    src.get("content") or
                     ""
                 )
-                
+
                 if not text or len(text.strip()) < 10:
                     continue
-                
+
                 cleaned = clean_text(text)
                 if cleaned and len(cleaned) > 10:
+                    # Get cached embedding if available
+                    cached_embedding = src.get("embedding")
+                    has_cached = cached_embedding is not None and len(cached_embedding) == EMBEDDING_DIM
+
+                    if has_cached:
+                        cached_count += 1
+
                     docs.append({
                         "id": hit["_id"],
                         "text": text.strip(),
@@ -182,12 +262,13 @@ def fetch_posts(client: OpenSearch) -> List[Dict]:
                         "likes": src.get("likes", 0) or 0,
                         "retweets": src.get("retweets", 0) or 0,
                         "replies": src.get("replies", 0) or 0,
+                        "cached_embedding": np.array(cached_embedding) if has_cached else None,
                     })
             except Exception as e:
                 logger.warning(f"⚠️ Error processing document {hit.get('_id')}: {e}")
                 continue
-        
-        logger.info(f"✅ Loaded {len(docs)} valid posts")
+
+        logger.info(f"✅ Loaded {len(docs)} valid posts ({cached_count} with cached embeddings, {len(docs) - cached_count} need embedding)")
         return docs
         
     except Exception as e:
@@ -196,11 +277,11 @@ def fetch_posts(client: OpenSearch) -> List[Dict]:
 
 # ====== EMBEDDING & CLUSTERING ======
 class EmbeddingProcessor:
-    """Handle text embeddings and clustering."""
-    
+    """Handle text embeddings and clustering with caching support."""
+
     def __init__(self):
         self.model = None
-    
+
     def load_model(self):
         """Load sentence transformer model."""
         if self.model is None:
@@ -210,28 +291,66 @@ class EmbeddingProcessor:
             )
             logger.info("✅ Model loaded")
         return self.model
-    
+
     def create_embeddings(self, docs: List[Dict]) -> np.ndarray:
-        """Create embeddings for documents."""
-        logger.info(f"🔢 Creating embeddings for {len(docs)} posts...")
-        
-        model = self.load_model()
-        texts = [d["cleaned"] for d in docs]
-        
-        try:
-            embeddings = model.encode(
-                texts,
-                convert_to_numpy=True,
-                show_progress_bar=True,
-                batch_size=EMBEDDING_BATCH_SIZE,
-                normalize_embeddings=True
-            )
-            
-            logger.info(f"✅ Created embeddings: shape={embeddings.shape}")
-            return embeddings
-        except Exception as e:
-            logger.error(f"❌ Error creating embeddings: {e}")
-            raise
+        """
+        Create embeddings for documents, using cached embeddings when available.
+        Only computes new embeddings for posts without cached vectors.
+        Returns the full embedding matrix and marks docs with new embeddings.
+        """
+        total_docs = len(docs)
+
+        # Separate docs with and without cached embeddings
+        docs_needing_embedding = []
+        docs_needing_indices = []
+
+        for i, doc in enumerate(docs):
+            if doc.get("cached_embedding") is None:
+                docs_needing_embedding.append(doc)
+                docs_needing_indices.append(i)
+
+        cached_count = total_docs - len(docs_needing_embedding)
+        logger.info(f"🔢 Processing {total_docs} posts: {cached_count} cached, {len(docs_needing_embedding)} need embedding")
+
+        # Initialize embeddings array
+        embeddings = np.zeros((total_docs, EMBEDDING_DIM), dtype=np.float32)
+
+        # Fill in cached embeddings
+        for i, doc in enumerate(docs):
+            if doc.get("cached_embedding") is not None:
+                embeddings[i] = doc["cached_embedding"]
+
+        # Generate new embeddings only for docs that need them
+        if docs_needing_embedding:
+            logger.info(f"🔢 Generating embeddings for {len(docs_needing_embedding)} new posts...")
+            model = self.load_model()
+            texts = [d["cleaned"] for d in docs_needing_embedding]
+
+            try:
+                new_embeddings = model.encode(
+                    texts,
+                    convert_to_numpy=True,
+                    show_progress_bar=True,
+                    batch_size=EMBEDDING_BATCH_SIZE,
+                    normalize_embeddings=True
+                )
+
+                # Fill in new embeddings and mark docs for saving
+                for j, idx in enumerate(docs_needing_indices):
+                    embeddings[idx] = new_embeddings[j]
+                    # Mark this doc as having a new embedding to save
+                    docs[idx]["new_embedding"] = new_embeddings[j]
+
+                logger.info(f"✅ Generated {len(docs_needing_embedding)} new embeddings")
+
+            except Exception as e:
+                logger.error(f"❌ Error creating embeddings: {e}")
+                raise
+        else:
+            logger.info("✅ All embeddings loaded from cache - no model inference needed!")
+
+        logger.info(f"✅ Total embeddings ready: shape={embeddings.shape}")
+        return embeddings
     
     def reduce_dimensionality(self, embeddings: np.ndarray) -> np.ndarray:
         """Reduce dimensionality using PCA."""
@@ -529,59 +648,66 @@ def print_trending_topics(topics: List[Dict]):
 def main():
     """Main execution function."""
     start_time = time.time()
-    
+
     try:
         validate_config()
-        
+
         # Create OpenSearch client
         client = create_opensearch_client()
-        
-        # Fetch posts
+
+        # Ensure embedding field exists in index mapping
+        ensure_embedding_mapping(client)
+
+        # Fetch posts (including cached embeddings)
         docs = fetch_posts(client)
-        
+
         if len(docs) < MIN_CLUSTER_SIZE:
             logger.error(f"❌ Not enough posts ({len(docs)} < {MIN_CLUSTER_SIZE})")
             return
-        
-        # Create embeddings
+
+        # Create embeddings (uses cache, only generates for new posts)
         embedding_processor = EmbeddingProcessor()
         embeddings = embedding_processor.create_embeddings(docs)
-        
+
+        # Save new embeddings back to OpenSearch for future runs
+        save_embeddings_to_opensearch(client, docs)
+
         # Reduce dimensionality
         embeddings_reduced = embedding_processor.reduce_dimensionality(embeddings)
-        
+
         # Cluster documents
         labels = embedding_processor.cluster_documents(embeddings_reduced)
-        
+
         # Analyze trending topics
         trending_topics = analyze_trending_topics(docs, labels, embeddings_reduced)
-        
+
         if not trending_topics:
             logger.warning("⚠️ No trending topics found")
             return
-        
+
         # Save to OpenSearch
         save_trending_topics(client, trending_topics)
-        
+
         # Print results
         print_trending_topics(trending_topics)
-        
+
         # Save JSON file
         output_file = f"trending_topics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(trending_topics, f, ensure_ascii=False, indent=2)
         logger.info(f"💾 Saved results to {output_file}")
-        
+
         elapsed = time.time() - start_time
         logger.info(f"\n🎉 Complete! Time: {elapsed:.2f}s ({elapsed/60:.2f} min)")
         logger.info(f"📊 Processed {len(docs)} posts, found {len(trending_topics)} trending topics")
-        
+
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}", exc_info=True)
         raise
     finally:
         if 'client' in locals():
             client.close()
+
 
 if __name__ == "__main__":
     main()

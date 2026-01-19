@@ -25,8 +25,14 @@ from get_trending_topics import (
     EmbeddingProcessor,
     analyze_trending_topics,
     save_trending_topics,
-    print_trending_topics
+    print_trending_topics,
+    ensure_embedding_mapping,
+    save_embeddings_to_opensearch,
+    EMBEDDING_DIM,
+    clean_text,
+    SOURCE_INDEX
 )
+import numpy as np
 
 # ====== SETUP ======
 load_dotenv()
@@ -364,27 +370,31 @@ def process_trending_topics_job(
     """
     Background function to process trending topics generation.
     Updates job status as it progresses.
+    Uses cached embeddings when available to avoid recomputation.
     """
     try:
         logger.info(f"🔄 Starting job processing: {job_id}")
         update_job_status(job_id, "processing", progress=10)
-        
+
         # Validate configuration
         validate_config()
-        
+
         # Create OpenSearch client
         client = create_opensearch_client()
-        
+
         try:
+            # Ensure embedding field exists in index mapping
+            ensure_embedding_mapping(client)
+
             update_job_status(job_id, "processing", progress=20)
-            
-            # Fetch posts with filters
+
+            # Fetch posts with filters (includes cached embeddings)
             posts = fetch_posts_with_filters(
                 client,
                 user_input_id=user_input_id,
                 source_ids=source_ids
             )
-            
+
             if not posts:
                 update_job_status(
                     job_id,
@@ -392,10 +402,10 @@ def process_trending_topics_job(
                     error="No posts found matching the filters"
                 )
                 return
-            
+
             logger.info(f"✅ Found {len(posts)} posts matching filters")
             update_job_status(job_id, "processing", progress=30)
-            
+
             # Import clustering components
             from get_trending_topics import (
                 MIN_CLUSTER_SIZE,
@@ -404,10 +414,10 @@ def process_trending_topics_job(
                 PCA_TARGET_DIM,
                 EMBEDDING_BATCH_SIZE
             )
-            
+
             # Use provided min_cluster_size or default
             effective_min_cluster_size = max(min_cluster_size, MIN_CLUSTER_SIZE)
-            
+
             if len(posts) < effective_min_cluster_size:
                 update_job_status(
                     job_id,
@@ -415,12 +425,15 @@ def process_trending_topics_job(
                     error=f"Not enough posts ({len(posts)} < {effective_min_cluster_size})"
                 )
                 return
-            
-            # Create embeddings
+
+            # Create embeddings (uses cache, only generates for new posts)
             update_job_status(job_id, "processing", progress=40)
             embedding_processor = EmbeddingProcessor()
             embeddings = embedding_processor.create_embeddings(posts)
-            
+
+            # Save new embeddings back to OpenSearch for future runs
+            save_embeddings_to_opensearch(client, posts)
+
             # Reduce dimensionality
             update_job_status(job_id, "processing", progress=60)
             embeddings_reduced = embedding_processor.reduce_dimensionality(embeddings)
@@ -486,28 +499,27 @@ def fetch_posts_with_filters(
 ):
     """
     Fetch posts with optional filters for user_input_id and source_ids.
-    
+    Includes cached embeddings when available.
+
     Args:
         client: OpenSearch client
         user_input_id: Optional user input ID to filter by
         source_ids: Optional list of source IDs to filter by (None = all sources)
-    
+
     Returns:
-        List of filtered posts
+        List of filtered posts with cached embeddings if available
     """
-    from get_trending_topics import SOURCE_INDEX, clean_text
-    
     logger.info(f"📥 Fetching posts with filters: user_input_id={user_input_id}, source_ids={source_ids}")
-    
+
     # Build query with filters
     must_clauses = []
-    
+
     if user_input_id:
         must_clauses.append({"term": {"user_input_id": user_input_id}})
-    
+
     if source_ids:
         must_clauses.append({"terms": {"source_id": source_ids}})
-    
+
     query = {
         "query": {
             "bool": {
@@ -516,14 +528,16 @@ def fetch_posts_with_filters(
         },
         "_source": [
             "post_text", "text", "content", "created_at", "timestamp",
-            "author", "likes", "retweets", "replies", "user_input_id", "source_id"
+            "author", "likes", "retweets", "replies", "user_input_id", "source_id",
+            "embedding", "embedding_updated_at"  # Include cached embeddings
         ]
     }
-    
+
     docs = []
+    cached_count = 0
     try:
         from opensearchpy import helpers
-        
+
         for hit in helpers.scan(
             client,
             query=query,
@@ -534,20 +548,27 @@ def fetch_posts_with_filters(
         ):
             try:
                 src = hit.get("_source", {})
-                
+
                 # Try multiple field names for post text
                 text = (
-                    src.get("post_text") or 
-                    src.get("text") or 
-                    src.get("content") or 
+                    src.get("post_text") or
+                    src.get("text") or
+                    src.get("content") or
                     ""
                 )
-                
+
                 if not text or len(text.strip()) < 10:
                     continue
-                
+
                 cleaned = clean_text(text)
                 if cleaned and len(cleaned) > 10:
+                    # Get cached embedding if available
+                    cached_embedding = src.get("embedding")
+                    has_cached = cached_embedding is not None and len(cached_embedding) == EMBEDDING_DIM
+
+                    if has_cached:
+                        cached_count += 1
+
                     docs.append({
                         "id": hit["_id"],
                         "text": text.strip(),
@@ -559,14 +580,15 @@ def fetch_posts_with_filters(
                         "replies": src.get("replies", 0) or 0,
                         "user_input_id": src.get("user_input_id"),
                         "source_id": src.get("source_id"),
+                        "cached_embedding": np.array(cached_embedding) if has_cached else None,
                     })
             except Exception as e:
                 logger.warning(f"⚠️ Error processing document {hit.get('_id')}: {e}")
                 continue
-        
-        logger.info(f"✅ Loaded {len(docs)} valid posts with filters")
+
+        logger.info(f"✅ Loaded {len(docs)} valid posts ({cached_count} with cached embeddings, {len(docs) - cached_count} need embedding)")
         return docs
-        
+
     except Exception as e:
         logger.error(f"❌ Error fetching posts: {e}")
         raise

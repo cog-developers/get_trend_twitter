@@ -1,6 +1,6 @@
 """
-RabbitMQ Worker Service
-Dedicated worker process for consuming trending topics generation jobs from RabbitMQ.
+Trending Topics Worker Service
+Dedicated worker process for polling active user inputs from MySQL and processing them.
 This runs as a separate service (systemd) and should NOT be run with PM2.
 
 Usage:
@@ -19,8 +19,7 @@ import hashlib
 from datetime import datetime
 from typing import Optional, List, Dict
 from dotenv import load_dotenv
-import pika
-from pika.exceptions import AMQPConnectionError
+import pymysql
 
 # Import trending topics functions
 from get_trending_topics import (
@@ -31,9 +30,13 @@ from get_trending_topics import (
     analyze_trending_topics,
     save_trending_topics,
     clean_text,
-    SOURCE_INDEX
+    SOURCE_INDEX,
+    ensure_embedding_mapping,
+    save_embeddings_to_opensearch,
+    EMBEDDING_DIM
 )
 from opensearchpy import helpers
+import numpy as np
 
 # ====== SETUP ======
 load_dotenv()
@@ -89,6 +92,59 @@ def update_job_status(job_id: str, status: str, result: Optional[Dict] = None, e
             if status in ["completed", "failed"]:
                 jobs[job_id]["finished_at"] = datetime.utcnow().isoformat()
 
+# ====== DATABASE ACCESS ======
+
+def validate_db_config():
+    """Validate database configuration from environment variables."""
+    required_vars = ["DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT"]
+    missing = [var for var in required_vars if not os.getenv(var)]
+    if missing:
+        raise ValueError(f"Missing DB env vars: {', '.join(missing)}")
+
+
+def get_db_connection():
+    """Create a MySQL database connection."""
+    return pymysql.connect(
+        host=os.getenv("DB_HOST"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        port=int(os.getenv("DB_PORT", "3306")),
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def fetch_active_inputs() -> List[Dict]:
+    """Fetch active user tracking inputs ordered by creation time."""
+    query = """
+        SELECT id, user_id, country, keywords, accounts, active, created_at, updated_at
+        FROM user_tracking_inputs
+        WHERE active = 1
+        ORDER BY created_at ASC
+    """
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+            return cursor.fetchall()
+    finally:
+        connection.close()
+
+
+def normalize_source_ids(raw_accounts) -> Optional[List[str]]:
+    """Normalize accounts field into a list of source IDs."""
+    if raw_accounts is None:
+        return None
+    if isinstance(raw_accounts, list):
+        return raw_accounts or None
+    if isinstance(raw_accounts, str):
+        try:
+            parsed = json.loads(raw_accounts)
+            return parsed or None
+        except json.JSONDecodeError:
+            return None
+    return None
+
 # ====== PROCESSING FUNCTIONS ======
 
 def fetch_posts_with_filters(
@@ -98,26 +154,27 @@ def fetch_posts_with_filters(
 ):
     """
     Fetch posts with optional filters for user_input_id and source_ids.
-    
+    Includes cached embeddings when available.
+
     Args:
         client: OpenSearch client
         user_input_id: Optional user input ID to filter by
         source_ids: Optional list of source IDs to filter by (None = all sources)
-    
+
     Returns:
-        List of filtered posts
+        List of filtered posts with cached embeddings if available
     """
     logger.info(f"📥 Fetching posts with filters: user_input_id={user_input_id}, source_ids={source_ids}")
-    
+
     # Build query with filters
     must_clauses = []
-    
+
     if user_input_id:
         must_clauses.append({"term": {"user_input_id": user_input_id}})
-    
+
     if source_ids:
         must_clauses.append({"terms": {"source_id": source_ids}})
-    
+
     query = {
         "query": {
             "bool": {
@@ -126,11 +183,13 @@ def fetch_posts_with_filters(
         },
         "_source": [
             "post_text", "text", "content", "created_at", "timestamp",
-            "author", "likes", "retweets", "replies", "user_input_id", "source_id"
+            "author", "likes", "retweets", "replies", "user_input_id", "source_id",
+            "embedding", "embedding_updated_at"  # Include cached embeddings
         ]
     }
-    
+
     docs = []
+    cached_count = 0
     try:
         for hit in helpers.scan(
             client,
@@ -142,20 +201,27 @@ def fetch_posts_with_filters(
         ):
             try:
                 src = hit.get("_source", {})
-                
+
                 # Try multiple field names for post text
                 text = (
-                    src.get("post_text") or 
-                    src.get("text") or 
-                    src.get("content") or 
+                    src.get("post_text") or
+                    src.get("text") or
+                    src.get("content") or
                     ""
                 )
-                
+
                 if not text or len(text.strip()) < 10:
                     continue
-                
+
                 cleaned = clean_text(text)
                 if cleaned and len(cleaned) > 10:
+                    # Get cached embedding if available
+                    cached_embedding = src.get("embedding")
+                    has_cached = cached_embedding is not None and len(cached_embedding) == EMBEDDING_DIM
+
+                    if has_cached:
+                        cached_count += 1
+
                     docs.append({
                         "id": hit["_id"],
                         "text": text.strip(),
@@ -167,14 +233,15 @@ def fetch_posts_with_filters(
                         "replies": src.get("replies", 0) or 0,
                         "user_input_id": src.get("user_input_id"),
                         "source_id": src.get("source_id"),
+                        "cached_embedding": np.array(cached_embedding) if has_cached else None,
                     })
             except Exception as e:
                 logger.warning(f"⚠️ Error processing document {hit.get('_id')}: {e}")
                 continue
-        
-        logger.info(f"✅ Loaded {len(docs)} valid posts with filters")
+
+        logger.info(f"✅ Loaded {len(docs)} valid posts ({cached_count} with cached embeddings, {len(docs) - cached_count} need embedding)")
         return docs
-        
+
     except Exception as e:
         logger.error(f"❌ Error fetching posts: {e}")
         raise
@@ -190,27 +257,31 @@ def process_trending_topics_job(
     """
     Background function to process trending topics generation.
     Updates job status as it progresses.
+    Uses cached embeddings when available to avoid recomputation.
     """
     try:
         logger.info(f"🔄 Starting job processing: {job_id}")
         update_job_status(job_id, "processing", progress=10)
-        
+
         # Validate configuration
         validate_config()
-        
+
         # Create OpenSearch client
         client = create_opensearch_client()
-        
+
         try:
+            # Ensure embedding field exists in index mapping
+            ensure_embedding_mapping(client)
+
             update_job_status(job_id, "processing", progress=20)
-            
-            # Fetch posts with filters
+
+            # Fetch posts with filters (includes cached embeddings)
             posts = fetch_posts_with_filters(
                 client,
                 user_input_id=user_input_id,
                 source_ids=source_ids
             )
-            
+
             if not posts:
                 update_job_status(
                     job_id,
@@ -218,10 +289,10 @@ def process_trending_topics_job(
                     error="No posts found matching the filters"
                 )
                 return
-            
+
             logger.info(f"✅ Found {len(posts)} posts matching filters")
             update_job_status(job_id, "processing", progress=30)
-            
+
             # Import clustering components
             from get_trending_topics import (
                 MIN_CLUSTER_SIZE,
@@ -230,10 +301,10 @@ def process_trending_topics_job(
                 PCA_TARGET_DIM,
                 EMBEDDING_BATCH_SIZE
             )
-            
+
             # Use provided min_cluster_size or default
             effective_min_cluster_size = max(min_cluster_size, MIN_CLUSTER_SIZE)
-            
+
             if len(posts) < effective_min_cluster_size:
                 update_job_status(
                     job_id,
@@ -241,12 +312,15 @@ def process_trending_topics_job(
                     error=f"Not enough posts ({len(posts)} < {effective_min_cluster_size})"
                 )
                 return
-            
-            # Create embeddings
+
+            # Create embeddings (uses cache, only generates for new posts)
             update_job_status(job_id, "processing", progress=40)
             embedding_processor = EmbeddingProcessor()
             embeddings = embedding_processor.create_embeddings(posts)
-            
+
+            # Save new embeddings back to OpenSearch for future runs
+            save_embeddings_to_opensearch(client, posts)
+
             # Reduce dimensionality
             update_job_status(job_id, "processing", progress=60)
             embeddings_reduced = embedding_processor.reduce_dimensionality(embeddings)
@@ -303,121 +377,64 @@ def process_trending_topics_job(
         update_job_status(job_id, "failed", error=f"Processing error: {str(e)}")
 
 
-# ====== RABBITMQ CONSUMER ======
-
-def on_message(channel, method, properties, body):
-    """Process incoming message from RabbitMQ queue"""
+def process_active_inputs():
+    """Fetch and process active user inputs."""
     try:
-        logger.info(f"📨 Received message from RabbitMQ queue: trending-topics")
-        
-        # Parse message
-        message = json.loads(body)
-        user_input_id = message.get('user-input-id') or message.get('user_input_id')
-        source_ids = message.get('source-ids') or message.get('source_ids')
-        min_cluster_size = message.get('min_cluster_size', 5)
-        save_to_index = message.get('save_to_index', True)
-        
-        logger.info(f"📥 Processing request: user_input_id={user_input_id}, source_ids={source_ids}")
-        
-        # Generate job ID
-        job_id = generate_job_id(user_input_id, source_ids)
-        
-        # Check if job already exists
-        existing_job = get_job_status(job_id)
-        if existing_job and existing_job["status"] in ["pending", "processing"]:
-            logger.info(f"⏳ Job {job_id} already in progress, skipping")
-            channel.basic_ack(delivery_tag=method.delivery_tag)
+        logger.info("📥 Fetching active user tracking inputs...")
+        active_inputs = fetch_active_inputs()
+        logger.info(f"✅ Found {len(active_inputs)} active inputs to process")
+
+        if not active_inputs:
+            logger.info("ℹ️ No active inputs found. Exiting.")
             return
-        
-        # Create new job
-        job = create_job(job_id, user_input_id, source_ids)
-        
-        # Process job synchronously (this is a worker, not a thread)
-        process_trending_topics_job(
-            job_id, 
-            user_input_id, 
-            source_ids, 
-            min_cluster_size, 
-            save_to_index
-        )
-        
-        logger.info(f"✅ Completed job from RabbitMQ: {job_id}")
-        
-        # Acknowledge message
-        channel.basic_ack(delivery_tag=method.delivery_tag)
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ Invalid JSON in message: {e}")
-        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-    except Exception as e:
-        logger.error(f"❌ Error processing RabbitMQ message: {e}", exc_info=True)
-        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
+        for input_row in active_inputs:
+            user_input_id = str(input_row.get("id"))
+            source_ids = normalize_source_ids(input_row.get("accounts"))
+            min_cluster_size = 5
+            save_to_index = True
 
-def connect_and_consume():
-    """Connect to RabbitMQ and start consuming messages - BLOCKS until interrupted"""
-    rabbitmq_url = os.getenv('RABBITMQ_URL')
-    queue_name = 'trending-topics'
-    
-    if not rabbitmq_url:
-        logger.error("❌ RABBITMQ_URL environment variable not set")
-        raise ValueError("RABBITMQ_URL is required")
-    
-    while True:
-        try:
-            logger.info(f"🔌 Connecting to RabbitMQ: {rabbitmq_url.split('@')[1] if '@' in rabbitmq_url else rabbitmq_url}")
-            
-            # Parse connection URL
-            connection_params = pika.URLParameters(rabbitmq_url)
-            connection = pika.BlockingConnection(connection_params)
-            channel = connection.channel()
-            
-            # Declare queue (create if doesn't exist)
-            channel.queue_declare(queue=queue_name, durable=True)
-            
-            # Set QoS to process one message at a time
-            channel.basic_qos(prefetch_count=1)
-            
-            # Set up consumer
-            channel.basic_consume(
-                queue=queue_name,
-                on_message_callback=on_message
+            logger.info(f"📊 Processing input: user_input_id={user_input_id}, source_ids={source_ids}")
+
+            job_id = generate_job_id(user_input_id, source_ids)
+            existing_job = get_job_status(job_id)
+            if existing_job and existing_job["status"] in ["pending", "processing"]:
+                logger.info(f"⏳ Job {job_id} already in progress, skipping")
+                continue
+
+            create_job(job_id, user_input_id, source_ids)
+            process_trending_topics_job(
+                job_id,
+                user_input_id,
+                source_ids,
+                min_cluster_size,
+                save_to_index
             )
-            
-            logger.info(f"✅ RabbitMQ consumer started. Listening to queue: {queue_name}")
-            logger.info(f"⏳ Waiting for messages. To exit press CTRL+C")
-            
-            # Start consuming - THIS BLOCKS
-            channel.start_consuming()
-            
-        except AMQPConnectionError as e:
-            logger.error(f"❌ RabbitMQ connection error: {e}. Retrying in 10 seconds...")
-            time.sleep(10)
-        except KeyboardInterrupt:
-            logger.info("🛑 RabbitMQ consumer stopped by user")
-            if 'connection' in locals() and not connection.is_closed:
-                connection.close()
-            break
-        except Exception as e:
-            logger.error(f"❌ Unexpected error in RabbitMQ consumer: {e}", exc_info=True)
-            time.sleep(10)
+    except Exception as e:
+        logger.error(f"❌ Error in process_active_inputs: {e}", exc_info=True)
+        raise
 
 
 # ====== MAIN ======
 if __name__ == '__main__':
-    logger.info("🚀 Starting RabbitMQ Worker Service")
-    logger.info("📡 This service consumes messages from 'trending-topics' queue")
+    logger.info("🚀 Starting Trending Topics Worker Service")
+    logger.info("📡 This service polls MySQL for active user inputs")
     logger.info("⚠️  This should be run with systemd, NOT PM2")
     
     # Validate configuration
     try:
         validate_config()
-        rabbitmq_url = os.getenv('RABBITMQ_URL')
-        if not rabbitmq_url:
-            raise ValueError("RABBITMQ_URL environment variable is required")
+        validate_db_config()
     except Exception as e:
         logger.error(f"❌ Configuration error: {e}")
         exit(1)
     
-    # Start consuming - this blocks forever
-    connect_and_consume()
+    poll_seconds = int(os.getenv("ACTIVE_INPUT_POLL_SECONDS", "300"))
+    if poll_seconds <= 0:
+        process_active_inputs()
+        exit(0)
+
+    while True:
+        process_active_inputs()
+        logger.info(f"⏳ Sleeping {poll_seconds}s before next poll")
+        time.sleep(poll_seconds)
