@@ -33,7 +33,8 @@ from get_trending_topics import (
     SOURCE_INDEX,
     ensure_embedding_mapping,
     save_embeddings_to_opensearch,
-    EMBEDDING_DIM
+    EMBEDDING_DIM,
+    MAX_TOPICS
 )
 from opensearchpy import helpers
 import numpy as np
@@ -103,15 +104,21 @@ def validate_db_config():
 
 
 def get_db_connection():
-    """Create a MySQL database connection."""
-    return pymysql.connect(
-        host=os.getenv("DB_HOST"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        database=os.getenv("DB_NAME"),
-        port=int(os.getenv("DB_PORT", "3306")),
-        cursorclass=pymysql.cursors.DictCursor,
-    )
+    """Create a MySQL database connection, retrying on failure."""
+    retry_delay = float(os.getenv("DB_RETRY_DELAY_SECONDS", "5"))
+    while True:
+        try:
+            return pymysql.connect(
+                host=os.getenv("DB_HOST"),
+                user=os.getenv("DB_USER"),
+                password=os.getenv("DB_PASSWORD"),
+                database=os.getenv("DB_NAME"),
+                port=int(os.getenv("DB_PORT", "3306")),
+                cursorclass=pymysql.cursors.DictCursor,
+            )
+        except pymysql.MySQLError as exc:
+            logger.warning("DB connection failed; retrying in %ss: %s", retry_delay, exc)
+            time.sleep(retry_delay)
 
 
 def fetch_active_inputs() -> List[Dict]:
@@ -228,6 +235,8 @@ def fetch_posts_with_filters(
                         "cleaned": cleaned,
                         "author": src.get("author"),
                         "created_at": src.get("created_at") or src.get("timestamp"),
+                        "timestamp": src.get("timestamp"),
+                        "post_created_at": src.get("post_created_at"),
                         "likes": src.get("likes", 0) or 0,
                         "retweets": src.get("retweets", 0) or 0,
                         "replies": src.get("replies", 0) or 0,
@@ -331,18 +340,26 @@ def process_trending_topics_job(
             
             # Analyze trending topics
             update_job_status(job_id, "processing", progress=85)
-            trending_topics = analyze_trending_topics(posts, labels, embeddings_reduced)
+            trending_topics = analyze_trending_topics(
+                posts,
+                labels,
+                embeddings_reduced=embeddings_reduced,
+                embeddings_raw=embeddings,
+                max_topics=MAX_TOPICS
+            )
             
             # Add filter metadata to each topic and make cluster_id unique
             filtered_sources = source_ids if source_ids else []
-            filter_hash = hash(f"{user_input_id}_{str(source_ids)}")
+            # Use stable filter key (job_id is md5 of filter params)
+            filter_key = job_id
             
             for topic in trending_topics:
                 topic['user_input_id'] = user_input_id
                 topic['filtered_sources'] = filtered_sources
+                topic['filter_key'] = filter_key
                 # Make cluster_id unique by adding filter hash
                 original_cluster_id = topic.get('cluster_id', '')
-                topic['cluster_id'] = f"{original_cluster_id}_{abs(filter_hash)}"
+                topic['cluster_id'] = f"{original_cluster_id}_{filter_key}"
             
             # Save to OpenSearch if requested
             if save_to_index:

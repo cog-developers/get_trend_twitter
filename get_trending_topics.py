@@ -18,6 +18,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import KMeans
 import hdbscan
 import urllib3
 import warnings
@@ -57,6 +58,7 @@ HDBSCAN_MIN_SAMPLES = int(os.getenv("HDBSCAN_MIN_SAMPLES", "3"))
 PCA_TARGET_DIM = int(os.getenv("PCA_TARGET_DIM", "100"))
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
+MAX_TOPICS = int(os.getenv("MAX_TOPICS", "20"))
 EMBEDDING_DIM = 512  # distiluse-base-multilingual-cased-v2 output dimension
 
 ARABIC_STOPWORDS = {
@@ -206,6 +208,51 @@ def clean_text(text: str) -> str:
     
     return " ".join(words)
 
+def _parse_any_datetime_to_epoch_millis(value) -> Optional[int]:
+    """
+    Best-effort parse for OpenSearch date-ish values.
+
+    Supports:
+    - epoch millis (int/float)
+    - ISO strings with/without 'Z'
+    - datetime-like strings that datetime.fromisoformat can parse
+    Returns epoch millis (UTC) or None.
+    """
+    if value is None:
+        return None
+
+    # epoch millis
+    if isinstance(value, (int, float)):
+        # If it looks like seconds, convert to millis (heuristic)
+        if value < 10_000_000_000:  # < ~2286-11-20 in seconds
+            return int(value * 1000)
+        return int(value)
+
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        # Handle "Z"
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return None
+
+    return None
+
+def _get_post_timestamp_millis(post: Dict) -> Optional[int]:
+    """Extract the best available post timestamp as epoch millis."""
+    for field in ("timestamp", "created_at", "post_created_at"):
+        ts = _parse_any_datetime_to_epoch_millis(post.get(field))
+        if ts is not None:
+            return ts
+    return None
+
 # ====== FETCH POSTS ======
 def fetch_posts(client: OpenSearch) -> List[Dict]:
     """Fetch posts from user-input-posts index, including cached embeddings."""
@@ -259,6 +306,8 @@ def fetch_posts(client: OpenSearch) -> List[Dict]:
                         "cleaned": cleaned,
                         "author": src.get("author"),
                         "created_at": src.get("created_at") or src.get("timestamp"),
+                        "timestamp": src.get("timestamp"),
+                        "post_created_at": src.get("post_created_at"),
                         "likes": src.get("likes", 0) or 0,
                         "retweets": src.get("retweets", 0) or 0,
                         "replies": src.get("replies", 0) or 0,
@@ -454,9 +503,17 @@ def generate_cluster_topic(posts_text: str) -> str:
 def analyze_trending_topics(
     docs: List[Dict],
     labels: np.ndarray,
-    embeddings: np.ndarray
+    embeddings_reduced: np.ndarray,
+    embeddings_raw: np.ndarray,
+    max_topics: int = MAX_TOPICS
 ) -> List[Dict]:
-    """Analyze clusters and identify trending topics."""
+    """
+    Analyze clusters and identify trending topics.
+
+    If more than `max_topics` clusters are found, clusters are merged down to
+    `max_topics` using KMeans on cluster centroids (in reduced embedding space),
+    so that each topic contains more posts.
+    """
     logger.info("📊 Analyzing trending topics...")
     
     clusters = {}
@@ -487,21 +544,60 @@ def analyze_trending_topics(
         if len(v["posts"]) >= MIN_CLUSTER_SIZE
     }
     
-    logger.info(f"📈 Analyzing {len(valid_clusters)} valid clusters...")
+    # Merge clusters down to max_topics (if needed)
+    merged_clusters = valid_clusters
+    if max_topics and max_topics > 0 and len(valid_clusters) > max_topics:
+        logger.info(f"🧩 Merging {len(valid_clusters)} clusters → {max_topics} topics (MAX_TOPICS)")
+        cluster_ids = list(valid_clusters.keys())
+        centroids = []
+        for cid in cluster_ids:
+            idxs = valid_clusters[cid]["indices"]
+            centroids.append(embeddings_reduced[idxs].mean(axis=0))
+        centroids = np.vstack(centroids)
+
+        try:
+            km = KMeans(n_clusters=max_topics, random_state=42, n_init=10)
+            assignments = km.fit_predict(centroids)
+        except Exception as e:
+            logger.warning(f"⚠️ KMeans merge failed, falling back to top-{max_topics} clusters: {e}")
+            # Fallback: keep largest clusters only
+            top = sorted(
+                valid_clusters.items(),
+                key=lambda kv: (len(kv[1]["posts"]), kv[1]["total_engagement"]),
+                reverse=True
+            )[:max_topics]
+            merged_clusters = {i: v for i, (_, v) in enumerate(top)}
+        else:
+            grouped = {}
+            for cid, g in zip(cluster_ids, assignments):
+                grouped.setdefault(int(g), {"posts": [], "indices": [], "total_engagement": 0})
+                grouped[int(g)]["posts"].extend(valid_clusters[cid]["posts"])
+                grouped[int(g)]["indices"].extend(valid_clusters[cid]["indices"])
+                grouped[int(g)]["total_engagement"] += valid_clusters[cid]["total_engagement"]
+            merged_clusters = grouped
+
+    logger.info(f"📈 Analyzing {len(merged_clusters)} clusters after merge...")
     
     trending_topics = []
     
-    for cluster_id, cluster_data in valid_clusters.items():
+    for cluster_id, cluster_data in merged_clusters.items():
         posts = cluster_data["posts"]
         size = len(posts)
         engagement = cluster_data["total_engagement"]
         
-        # Get representative texts (top 5)
-        cluster_embeds = embeddings[cluster_data["indices"]]
-        centroid = cluster_embeds.mean(axis=0, keepdims=True)
-        sims = cosine_similarity(cluster_embeds, centroid).flatten()
+        # Get representative texts (top 5) using reduced space for speed
+        cluster_embeds_reduced = embeddings_reduced[cluster_data["indices"]]
+        centroid_reduced = cluster_embeds_reduced.mean(axis=0, keepdims=True)
+        sims = cosine_similarity(cluster_embeds_reduced, centroid_reduced).flatten()
         top_indices = np.argsort(-sims)[:5]
         representative_texts = [posts[i]["text"] for i in top_indices]
+
+        # Stable centroid for incremental assignment (raw embedding space)
+        cluster_embeds_raw = embeddings_raw[cluster_data["indices"]]
+        centroid_raw = cluster_embeds_raw.mean(axis=0)
+        norm = float(np.linalg.norm(centroid_raw))
+        if norm > 0:
+            centroid_raw = centroid_raw / norm
         
         # Generate topic
         sample_text = "\n---\n".join([p["text"][:300] for p in posts[:10]])
@@ -524,6 +620,14 @@ def analyze_trending_topics(
         
         current_time = datetime.utcnow()
         timestamp_ms = int(current_time.timestamp() * 1000)  # Unix timestamp in milliseconds
+
+        # Track max post timestamp in this topic (for incremental state)
+        post_ts = []
+        for p in posts:
+            t = _get_post_timestamp_millis(p)
+            if t is not None:
+                post_ts.append(t)
+        last_post_timestamp_ms = max(post_ts) if post_ts else None
         
         trending_topics.append({
             "topic": topic,
@@ -534,12 +638,18 @@ def analyze_trending_topics(
             "keywords": keywords,
             "representative_texts": representative_texts[:3],
             "member_ids": [p["id"] for p in posts],
+            "centroid_embedding": centroid_raw.tolist() if hasattr(centroid_raw, "tolist") else centroid_raw,
+            "last_post_timestamp": last_post_timestamp_ms,
             "generated_at": current_time.isoformat(),
             "timestamp": timestamp_ms
         })
     
     # Sort by trending score
     trending_topics.sort(key=lambda x: x["trending_score"], reverse=True)
+
+    # Enforce max_topics again post-scoring (safety)
+    if max_topics and max_topics > 0:
+        trending_topics = trending_topics[:max_topics]
     
     logger.info(f"✅ Identified {len(trending_topics)} trending topics")
     return trending_topics
@@ -566,11 +676,18 @@ def save_trending_topics(client: OpenSearch, topics: List[Dict]):
                     "keywords": {"type": "keyword"},
                     "representative_texts": {"type": "text"},
                     "member_ids": {"type": "keyword"},
+                    "centroid_embedding": {
+                        "type": "dense_vector",
+                        "dims": EMBEDDING_DIM,
+                        "index": False
+                    },
                     "generated_at": {"type": "date"},
                     "timestamp": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
+                    "last_post_timestamp": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
                     "rank": {"type": "integer"},
                     "user_input_id": {"type": "keyword"},
-                    "filtered_sources": {"type": "keyword"}
+                    "filtered_sources": {"type": "keyword"},
+                    "filter_key": {"type": "keyword"}
                 }
             }
         }
@@ -592,6 +709,19 @@ def save_trending_topics(client: OpenSearch, topics: List[Dict]):
             
             if "filtered_sources" not in properties:
                 missing_fields["filtered_sources"] = {"type": "keyword"}
+
+            if "filter_key" not in properties:
+                missing_fields["filter_key"] = {"type": "keyword"}
+
+            if "centroid_embedding" not in properties:
+                missing_fields["centroid_embedding"] = {
+                    "type": "dense_vector",
+                    "dims": EMBEDDING_DIM,
+                    "index": False
+                }
+
+            if "last_post_timestamp" not in properties:
+                missing_fields["last_post_timestamp"] = {"type": "date", "format": "strict_date_optional_time||epoch_millis"}
             
             if missing_fields:
                 logger.info(f"📝 Adding missing fields to existing index: {TRENDING_INDEX}")
@@ -635,7 +765,7 @@ def print_trending_topics(topics: List[Dict]):
     print("🔥 TRENDING TOPICS")
     print("=" * 80)
     
-    for i, topic_data in enumerate(topics[:20], 1):  # Top 20
+    for i, topic_data in enumerate(topics[:MAX_TOPICS], 1):  # Top N
         print(f"\n{i}. {topic_data['topic']}")
         print(f"   📊 Posts: {topic_data['post_count']} | "
               f"Engagement: {topic_data['engagement_score']:.1f} | "
@@ -679,7 +809,13 @@ def main():
         labels = embedding_processor.cluster_documents(embeddings_reduced)
 
         # Analyze trending topics
-        trending_topics = analyze_trending_topics(docs, labels, embeddings_reduced)
+        trending_topics = analyze_trending_topics(
+            docs,
+            labels,
+            embeddings_reduced=embeddings_reduced,
+            embeddings_raw=embeddings,
+            max_topics=MAX_TOPICS
+        )
 
         if not trending_topics:
             logger.warning("⚠️ No trending topics found")
