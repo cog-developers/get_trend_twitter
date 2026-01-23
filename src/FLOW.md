@@ -14,7 +14,8 @@ src/
 │   └── settings.py        # Configuration & environment variables
 ├── database/
 │   ├── opensearch.py      # OpenSearch database operations
-│   └── mysql.py           # MySQL database operations
+│   ├── mysql.py           # MySQL database operations
+│   └── redis_cache.py     # Redis embedding cache
 ├── processing/
 │   ├── text.py            # Text cleaning & normalization
 │   └── embeddings.py      # ML embeddings & clustering
@@ -45,6 +46,7 @@ src/
 │  • OPENSEARCH_NODE, USERNAME, PASSWORD                  │
 │  • DEEPSEEK_API_KEY, MODEL                              │
 │  • DB_HOST, DB_USER, DB_PASSWORD, DB_NAME               │
+│  • REDIS_URL, REDIS_DB, USE_REDIS_CACHE                 │
 │  • MIN_CLUSTER_SIZE, MAX_TOPICS, PCA_TARGET_DIM         │
 │                                                         │
 │  Constants:                                             │

@@ -19,13 +19,16 @@ from .config.settings import (
     MIN_CLUSTER_SIZE,
     MAX_TOPICS,
     ACTIVE_INPUT_POLL_SECONDS,
+    USE_REDIS_CACHE,
     get_logger
 )
 from .database.opensearch import (
     create_opensearch_client,
-    ensure_embedding_mapping,
-    save_embeddings_to_opensearch,
     save_trending_topics
+)
+from .database.redis_cache import (
+    save_embeddings_from_docs,
+    create_redis_client
 )
 from .database.mysql import (
     fetch_active_inputs,
@@ -69,8 +72,9 @@ def process_trending_topics_job(
         client = create_opensearch_client()
 
         try:
-            # Ensure embedding field exists in index mapping
-            ensure_embedding_mapping(client)
+            # Initialize Redis connection for embedding cache
+            if USE_REDIS_CACHE:
+                create_redis_client()
             update_job_status(job_id, "processing", progress=20)
 
             # Fetch posts with filters (includes cached embeddings)
@@ -107,8 +111,9 @@ def process_trending_topics_job(
             embedding_processor = EmbeddingProcessor()
             embeddings = embedding_processor.create_embeddings(posts)
 
-            # Save new embeddings back to OpenSearch for future runs
-            save_embeddings_to_opensearch(client, posts)
+            # Save new embeddings to Redis cache for future runs
+            if USE_REDIS_CACHE:
+                save_embeddings_from_docs(posts)
 
             # Reduce dimensionality
             update_job_status(job_id, "processing", progress=60)

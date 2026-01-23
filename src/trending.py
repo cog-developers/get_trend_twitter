@@ -10,13 +10,16 @@ from .config.settings import (
     validate_config,
     MIN_CLUSTER_SIZE,
     MAX_TOPICS,
+    USE_REDIS_CACHE,
     get_logger
 )
 from .database.opensearch import (
     create_opensearch_client,
-    ensure_embedding_mapping,
-    save_embeddings_to_opensearch,
     save_trending_topics
+)
+from .database.redis_cache import (
+    create_redis_client,
+    save_embeddings_from_docs
 )
 from .services.posts import fetch_posts
 from .processing.embeddings import EmbeddingProcessor
@@ -58,10 +61,11 @@ def run_trending_topics_pipeline(
         client = create_opensearch_client()
 
         try:
-            # Ensure embedding field exists in index mapping
-            ensure_embedding_mapping(client)
+            # Initialize Redis for embedding cache
+            if USE_REDIS_CACHE:
+                create_redis_client()
 
-            # Fetch posts (including cached embeddings)
+            # Fetch posts (cached embeddings loaded from Redis)
             docs = fetch_posts(
                 client,
                 user_input_id=user_input_id,
@@ -76,8 +80,9 @@ def run_trending_topics_pipeline(
             embedding_processor = EmbeddingProcessor()
             embeddings = embedding_processor.create_embeddings(docs)
 
-            # Save new embeddings back to OpenSearch for future runs
-            save_embeddings_to_opensearch(client, docs)
+            # Save new embeddings to Redis cache for future runs
+            if USE_REDIS_CACHE:
+                save_embeddings_from_docs(docs)
 
             # Reduce dimensionality
             embeddings_reduced = embedding_processor.reduce_dimensionality(embeddings)

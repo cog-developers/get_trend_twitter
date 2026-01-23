@@ -57,6 +57,13 @@ DB_RETRY_DELAY_SECONDS = float(os.getenv("DB_RETRY_DELAY_SECONDS", "5"))
 # ====== WORKER CONFIG ======
 ACTIVE_INPUT_POLL_SECONDS = int(os.getenv("ACTIVE_INPUT_POLL_SECONDS", "300"))
 
+# ====== REDIS CONFIG ======
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_EMBEDDING_PREFIX = "emb:"  # Key prefix for embeddings
+REDIS_EMBEDDING_TTL = int(os.getenv("REDIS_EMBEDDING_TTL", "604800"))  # 7 days default
+USE_REDIS_CACHE = os.getenv("USE_REDIS_CACHE", "1").lower() in ("1", "true", "yes")
+
 # ====== OPENSEARCH SCAN CONFIG ======
 OPENSEARCH_SCAN_SIZE = int(os.getenv("OPENSEARCH_SCAN_SIZE", "200"))
 OPENSEARCH_SCAN_RETRIES = int(os.getenv("OPENSEARCH_SCAN_RETRIES", "5"))
