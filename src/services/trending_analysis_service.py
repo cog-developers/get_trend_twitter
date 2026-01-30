@@ -155,7 +155,7 @@ def analyze_trending_topics(
         min_similarity = float(np.min(sims))
         
         # Filter out clusters with poor content correlation
-        MIN_CLUSTER_SIMILARITY = 0.65  # Minimum average similarity to centroid
+        MIN_CLUSTER_SIMILARITY = 0.45  # Minimum average similarity to centroid (lowered to capture more posts)
         if avg_similarity < MIN_CLUSTER_SIMILARITY:
             logger.warning(
                 f"⚠️ Filtering out cluster {cluster_id}: low average similarity {avg_similarity:.3f} "

@@ -66,11 +66,11 @@ def fetch_posts(client: OpenSearch, user_input_id: str = None, source_ids: List[
                     ""
                 )
 
-                if not text or len(text.strip()) < 10:
+                if not text or len(text.strip()) < 5:
                     continue
 
                 cleaned = clean_text(text)
-                if cleaned and len(cleaned) > 10:
+                if cleaned and len(cleaned) > 5:
                     # Get cached embedding if available
                     cached_embedding = src.get("embedding")
                     has_cached = cached_embedding is not None and len(cached_embedding) == EMBEDDING_DIM
